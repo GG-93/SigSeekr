@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SigSeeker</string>
+    <string name="cd_target_selector">Open emitter scanner list</string>
+    <string name="cd_geiger_toggle">Toggle audio and haptic Geiger proximity feedback</string>
+    <string name="cd_session_log">Open offline session snapshot log</string>
+    <string name="cd_reset_grid">Reset probability grid and re-center position</string>
+    <string name="cd_zero_heading">Zero compass heading offset</string>
+    <string name="cd_reset_target">Unlock target MAC address</string>
+    <string name="cd_save_snapshot">Save localization snapshot to offline log</string>
+    <string name="cd_calibration_drawer">Toggle RF and step calibration drawer</string>
+    <string name="cd_close_dialog">Close dialog</string>
+    <string name="cd_refresh_scan">Trigger manual Wi-Fi scan</string>
+    <string name="cd_delete_snapshot">Delete saved snapshot</string>
+    <string name="permission_title">RF &amp; Inertial Permissions Required</string>
+    <string name="permission_rationale">SigSeeker runs 100% offline using internal Wi-Fi RTT, BLE, and IMU sensors. Location and nearby radio permissions are required on Android 13/14+ and GrapheneOS so RSSI and RTT ranging data are not stripped.</string>
+    <string name="permission_grant_button">Grant Sensor &amp; Radio Access</string>
+    <string name="permission_settings_button">Open App Settings</string>
+</resources>

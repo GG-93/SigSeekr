@@ -1,0 +1,6 @@
+{
+  "name": "SigSeeker",
+  "description": "100% offline standalone Android RF localization radar using Wi-Fi RTT, shielded BLE/Wi-Fi RSSI sweeps, IMU dead-reckoning, and a 100x100 Bayesian probability grid.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
