@@ -16,7 +16,7 @@ enum class ShieldPreset(
     ),
     POCKET_BODY(
         displayName = "Breast Pocket / Body Shield",
-        shortLabel = "Pocket 16dB",
+        shortLabel = "Body 16dB",
         shieldDropDb = 16.0f
     ),
     FLAT_ALUMINUM(
@@ -30,12 +30,20 @@ enum class ShieldPreset(
         shieldDropDb = 27.0f
     );
 
-    /** Cycles the Top HUD Quick Carrying Mode pill: Omni 0dB -> Pocket 16dB -> Corner 27dB. */
+    /** Cycles the Top HUD Quick Carrying Mode pill: Omni 0dB -> Body 16dB -> Corner 27dB. */
     fun nextQuickCycle(): ShieldPreset = when (this) {
         OMNI_HANDHELD -> POCKET_BODY
         POCKET_BODY -> CORNER_REFLECTOR_90
         FLAT_ALUMINUM -> CORNER_REFLECTOR_90
         CORNER_REFLECTOR_90 -> OMNI_HANDHELD
+    }
+
+    fun contextualShortLabel(screenOutwardMode: Boolean): String {
+        return if (this == POCKET_BODY && screenOutwardMode) {
+            "Pocket +180° 16dB"
+        } else {
+            shortLabel
+        }
     }
 }
 

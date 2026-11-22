@@ -19,6 +19,7 @@ import android.net.wifi.rtt.RangingResultCallback
 import android.net.wifi.rtt.WifiRttManager
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.dsp.BleAdDecoder
 import com.example.dsp.DeviceFingerprintEngine
@@ -29,6 +30,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -77,6 +79,106 @@ class StandaloneRadioDataSource(
         }
 
     private val rttExecutor = Executors.newSingleThreadExecutor()
+    private val bleScanLock = Any()
+    private val bleSharedFlow = MutableSharedFlow<RfMeasurement>(extraBufferCapacity = 256)
+
+    @Volatile
+    private var persistentBleScanner: android.bluetooth.le.BluetoothLeScanner? = null
+
+    @Volatile
+    private var nextBleRetryAllowedMs: Long = 0L
+
+    private val persistentBleCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: BleScanResult) {
+            emitBleResult(result)
+        }
+
+        override fun onBatchScanResults(results: MutableList<BleScanResult>) {
+            for (result in results) {
+                emitBleResult(result)
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            Log.w("SigSeekrBLE", "BLE ScanCallback.onScanFailed(errorCode=$errorCode)")
+            synchronized(bleScanLock) {
+                persistentBleScanner = null
+                val backoffMs = if (errorCode == 6) 30_000L else 3_000L // 6 = SCAN_FAILED_SCANNING_TOO_FREQUENTLY
+                nextBleRetryAllowedMs = SystemClock.elapsedRealtime() + backoffMs
+            }
+        }
+
+        private fun emitBleResult(result: BleScanResult) {
+            val mac = result.device?.address?.uppercase() ?: return
+            val rawBytes = result.scanRecord?.bytes
+            val decoded = BleAdDecoder.parse(rawBytes)
+            val addressType = readBleAddressTypeSafely(result)
+            val fpHash = DeviceFingerprintEngine.fingerprintBle(mac, addressType, decoded)
+
+            val advertisedName = decoded.localName
+                ?: result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
+            val deviceName = advertisedName
+                ?: readBleDeviceNameSafely(result)
+                ?: decoded.trackerTag?.displayLabel
+                ?: decoded.companyName
+                ?: "BLE Emitter"
+
+            bleSharedFlow.tryEmit(
+                RfMeasurement(
+                    macAddress = mac,
+                    displayName = deviceName,
+                    transport = EmitterTransport.BLE,
+                    rssiDbm = result.rssi,
+                    isRttResponder = false,
+                    rttDistanceMeters = null,
+                    rttStdDevMeters = null,
+                    timestampElapsedMs = SystemClock.elapsedRealtime(),
+                    scanResult = null,
+                    fingerprintHash = fpHash,
+                    bleAddressType = addressType,
+                    bleDecoded = decoded
+                )
+            )
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun ensurePersistentBleScanStarted() {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(bleScanLock) {
+            val adapter = bluetoothManager?.adapter
+            if (adapter == null || !adapter.isEnabled) {
+                persistentBleScanner = null
+                return
+            }
+            if (persistentBleScanner != null) return
+            if (now < nextBleRetryAllowedMs) return
+            if (!hasBleScanPermission()) return
+
+            val scanner = try {
+                adapter.bluetoothLeScanner
+            } catch (_: SecurityException) {
+                null
+            } ?: return
+
+            try {
+                val settings = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                    .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                    .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                    .setReportDelay(0L)
+                    .build()
+                scanner.startScan(emptyList(), settings, persistentBleCallback)
+                persistentBleScanner = scanner
+                Log.i("SigSeekrBLE", "Persistent unfiltered BLE Scan started (LOW_LATENCY)")
+            } catch (e: SecurityException) {
+                Log.w("SigSeekrBLE", "BLE startScan SecurityException: ${e.message}")
+            } catch (e: IllegalStateException) {
+                Log.w("SigSeekrBLE", "BLE startScan IllegalStateException: ${e.message}")
+            }
+        }
+    }
 
     override val sourceName: String = "Standalone Internal Radios"
 
@@ -110,85 +212,13 @@ class StandaloneRadioDataSource(
     override fun measurementsFlow(): Flow<RfMeasurement> = callbackFlow {
         val scope = CoroutineScope(coroutineContext + Dispatchers.Default)
 
-        // 1. Continuous low-latency BLE advertisement scanner (with lazy retry if BT toggled on later)
-        var activeBleScanner: android.bluetooth.le.BluetoothLeScanner? = null
-
-        val bleCallback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: BleScanResult) {
-                emitBleResult(result)
-            }
-
-            override fun onBatchScanResults(results: MutableList<BleScanResult>) {
-                for (result in results) {
-                    emitBleResult(result)
-                }
-            }
-
-            private fun emitBleResult(result: BleScanResult) {
-                val mac = result.device?.address?.uppercase() ?: return
-                val rawBytes = result.scanRecord?.bytes
-                val decoded = BleAdDecoder.parse(rawBytes)
-                val addressType = readBleAddressTypeSafely(result)
-                val fpHash = DeviceFingerprintEngine.fingerprintBle(mac, addressType, decoded)
-
-                val advertisedName = decoded.localName
-                    ?: result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
-                val deviceName = advertisedName
-                    ?: readBleDeviceNameSafely(result)
-                    ?: decoded.trackerTag?.displayLabel
-                    ?: decoded.companyName
-                    ?: "BLE Emitter"
-
-                trySend(
-                    RfMeasurement(
-                        macAddress = mac,
-                        displayName = deviceName,
-                        transport = EmitterTransport.BLE,
-                        rssiDbm = result.rssi,
-                        isRttResponder = false,
-                        rttDistanceMeters = null,
-                        rttStdDevMeters = null,
-                        timestampElapsedMs = SystemClock.elapsedRealtime(),
-                        scanResult = null,
-                        fingerprintHash = fpHash,
-                        bleAddressType = addressType,
-                        bleDecoded = decoded
-                    )
-                )
+        // 1. Collect from single persistent BLE scanner session (never stops/restarts on flow re-collection)
+        val bleForwardJob = scope.launch {
+            bleSharedFlow.collect { measurement ->
+                trySend(measurement)
             }
         }
-
-        val ensureBleScanStarted: () -> Unit = {
-            if (activeBleScanner == null && hasBleScanPermission()) {
-                val scanner = try {
-                    val adapter = bluetoothManager?.adapter
-                    if (adapter != null && adapter.isEnabled) adapter.bluetoothLeScanner else null
-                } catch (_: SecurityException) {
-                    null
-                }
-                if (scanner != null) {
-                    try {
-                        val settings = ScanSettings.Builder()
-                            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-                            .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-                            .setReportDelay(0L)
-                            .build()
-                        scanner.startScan(null, settings, bleCallback)
-                        activeBleScanner = scanner
-                    } catch (_: SecurityException) {
-                        // Gracefully degrade if user revokes BLE permission mid-session
-                    } catch (_: IllegalStateException) {
-                        // Bluetooth radio toggled off
-                    }
-                }
-            } else if (activeBleScanner != null && bluetoothManager?.adapter?.isEnabled != true) {
-                activeBleScanner = null
-            }
-        }
-
-        ensureBleScanStarted()
+        ensurePersistentBleScanStarted()
 
         // 2. Wi-Fi ScanResult BroadcastReceiver + periodic trigger
         val emitLatestWifiResults: () -> Unit = {
@@ -204,6 +234,7 @@ class StandaloneRadioDataSource(
                     val bssid = sr.BSSID?.uppercase() ?: continue
                     if (bssid.isBlank() || bssid == "00:00:00:00:00:00") continue
                     val ssid = extractSsid(sr)
+                    val ieMeta = extractWifiIeMetadata(sr)
                     trySend(
                         RfMeasurement(
                             macAddress = bssid,
@@ -217,7 +248,16 @@ class StandaloneRadioDataSource(
                             scanResult = sr,
                             fingerprintHash = DeviceFingerprintEngine.fingerprintWifi(bssid),
                             bleAddressType = null,
-                            bleDecoded = null
+                            bleDecoded = null,
+                            wifiCapabilities = sr.capabilities,
+                            wifiVendorOuiHexes = ieMeta.vendorOuiHexes,
+                            frequencyMhz = sr.frequency,
+                            channelNumber = frequencyToChannel(sr.frequency),
+                            channelWidthMhz = channelWidthToMhz(sr.channelWidth),
+                            wifiStandardLabel = extractWifiStandardLabel(sr),
+                            wifiIeTags = ieMeta.ieTags,
+                            wifiVendorOuis = ieMeta.vendorOuis,
+                            wpsDeviceInfo = ieMeta.wpsInfo
                         )
                     )
                 }
@@ -250,28 +290,20 @@ class StandaloneRadioDataSource(
         val wifiPollJob = scope.launch {
             while (isActive) {
                 delay(3_500L)
-                ensureBleScanStarted()
+                ensurePersistentBleScanStarted()
                 triggerWifiScan()
                 emitLatestWifiResults()
             }
         }
 
         awaitClose {
+            bleForwardJob.cancel()
             wifiPollJob.cancel()
             if (receiverRegistered) {
                 try {
                     appContext.unregisterReceiver(wifiReceiver)
                 } catch (_: IllegalArgumentException) {
                     // Already unregistered
-                }
-            }
-            val scannerToStop = activeBleScanner
-            activeBleScanner = null
-            if (scannerToStop != null && hasBleScanPermission()) {
-                try {
-                    scannerToStop.stopScan(bleCallback)
-                } catch (_: Exception) {
-                    // Bluetooth radio may have turned off
                 }
             }
         }
@@ -387,6 +419,101 @@ class StandaloneRadioDataSource(
         return cleaned.ifBlank { "Hidden AP" }
     }
 
+    private data class WifiIeMetadata(
+        val ieTags: List<Int>,
+        val vendorOuiHexes: List<String>,
+        val vendorOuis: List<Pair<String, String>>,
+        val wpsInfo: String?
+    )
+
+    private fun extractWifiIeMetadata(scanResult: ScanResult): WifiIeMetadata {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return WifiIeMetadata(emptyList(), emptyList(), emptyList(), null)
+        }
+        return try {
+            val ies = scanResult.informationElements
+            val tags = ArrayList<Int>(ies.size)
+            val ouiHexes = mutableListOf<String>()
+            val ouiPairs = mutableListOf<Pair<String, String>>()
+            var wpsInfo: String? = null
+
+            for (ie in ies) {
+                tags.add(ie.id)
+                if (ie.id == 221) { // Vendor Specific IE
+                    val buf = ie.bytes
+                    if (buf.remaining() >= 3) {
+                        val b0 = buf.get().toInt() and 0xFF
+                        val b1 = buf.get().toInt() and 0xFF
+                        val b2 = buf.get().toInt() and 0xFF
+                        val oui = String.format(java.util.Locale.US, "%02X:%02X:%02X", b0, b1, b2)
+                        if (oui == "FA:0B:BC" && buf.remaining() >= 1) {
+                            val subType = buf.get().toInt() and 0xFF
+                            if (subType == 0x0D) {
+                                ouiHexes.add("FA:0B:BC:0D")
+                            }
+                        } else {
+                            ouiHexes.add(oui)
+                        }
+                        val vendorName = lookupVendorOuiName(oui)
+                        if (ouiPairs.none { it.first == oui }) {
+                            ouiPairs.add(oui to vendorName)
+                        }
+                        if (oui == "00:50:F2" && buf.remaining() >= 1) {
+                            val subtype = buf.get().toInt() and 0xFF
+                            if (subtype == 0x04) {
+                                wpsInfo = "WPS Broadcast (00:50:F2:04)"
+                            }
+                        }
+                    }
+                }
+            }
+            WifiIeMetadata(tags, ouiHexes, ouiPairs, wpsInfo)
+        } catch (_: Exception) {
+            WifiIeMetadata(emptyList(), emptyList(), emptyList(), null)
+        }
+    }
+
+    private fun lookupVendorOuiName(oui: String): String = when (oui) {
+        "00:50:F2" -> "Microsoft / WFA"
+        "00:90:4C", "00:10:18" -> "Broadcom"
+        "8C:FD:F0", "00:03:7F" -> "Qualcomm / Atheros"
+        "00:0C:43" -> "MediaTek / Ralink"
+        "50:6F:9A" -> "Wi-Fi Alliance (WFA)"
+        "FA:0B:BC" -> "ASTM OpenDroneID"
+        "26:37:12" -> "DJI DroneID"
+        "00:17:F2", "00:1B:63" -> "Apple"
+        else -> "Vendor ($oui)"
+    }
+
+    private fun frequencyToChannel(freqMhz: Int): Int = when {
+        freqMhz == 2484 -> 14
+        freqMhz in 2412..2472 -> (freqMhz - 2407) / 5
+        freqMhz in 5170..5825 -> (freqMhz - 5000) / 5
+        freqMhz in 5955..7115 -> (freqMhz - 5950) / 5
+        else -> 0
+    }
+
+    private fun channelWidthToMhz(widthConst: Int): Int = when (widthConst) {
+        ScanResult.CHANNEL_WIDTH_20MHZ -> 20
+        ScanResult.CHANNEL_WIDTH_40MHZ -> 40
+        ScanResult.CHANNEL_WIDTH_80MHZ -> 80
+        ScanResult.CHANNEL_WIDTH_160MHZ -> 160
+        ScanResult.CHANNEL_WIDTH_80MHZ_PLUS_MHZ -> 160
+        else -> 20
+    }
+
+    private fun extractWifiStandardLabel(sr: ScanResult): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return "802.11"
+        return when (sr.wifiStandard) {
+            ScanResult.WIFI_STANDARD_LEGACY -> "802.11a/b/g"
+            ScanResult.WIFI_STANDARD_11N -> "802.11n (Wi-Fi 4)"
+            ScanResult.WIFI_STANDARD_11AC -> "802.11ac (Wi-Fi 5)"
+            ScanResult.WIFI_STANDARD_11AX -> "802.11ax (Wi-Fi 6)"
+            ScanResult.WIFI_STANDARD_11BE -> "802.11be (Wi-Fi 7)"
+            else -> "802.11"
+        }
+    }
+
     private fun hasBleScanPermission(): Boolean {
         val fineLoc = ContextCompat.checkSelfPermission(
             appContext,
@@ -429,7 +556,18 @@ class StandaloneRadioDataSource(
         return fineLoc
     }
 
+    @SuppressLint("MissingPermission")
     fun shutdown() {
+        synchronized(bleScanLock) {
+            val scanner = persistentBleScanner
+            persistentBleScanner = null
+            if (scanner != null && hasBleScanPermission()) {
+                try {
+                    scanner.stopScan(persistentBleCallback)
+                } catch (_: Exception) {
+                }
+            }
+        }
         rttExecutor.shutdownNow()
     }
 }

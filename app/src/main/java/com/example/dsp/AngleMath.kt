@@ -137,4 +137,26 @@ object AngleMath {
             isTiltGuardTriggered = isShieldTiltGuarded(pitchDeg, rollDeg)
         )
     }
+
+    /**
+     * Projects the 3-axis device gyroscope angular velocity `(wx, wy, wz)` (rad/s)
+     * onto the world vertical (+Up) axis using the 3rd row of the 3x3 rotation
+     * matrix `(R[6], R[7], R[8])`, which transforms world +Up into device coordinates.
+     *
+     * Positive output corresponds to counter-clockwise rotation viewed from above
+     * (increasing mathematical Cartesian heading `theta`), independent of phone pitch/roll.
+     */
+    fun computeWorldVerticalYawRate(
+        wxRadPerSec: Float,
+        wyRadPerSec: Float,
+        wzRadPerSec: Float,
+        rotationMatrix: FloatArray
+    ): Double {
+        if (rotationMatrix.size < 9) return wzRadPerSec.toDouble()
+        val gx = rotationMatrix[6].toDouble()
+        val gy = rotationMatrix[7].toDouble()
+        val gz = rotationMatrix[8].toDouble()
+        val rate = wxRadPerSec * gx + wyRadPerSec * gy + wzRadPerSec * gz
+        return if (rate.isFinite()) rate else 0.0
+    }
 }

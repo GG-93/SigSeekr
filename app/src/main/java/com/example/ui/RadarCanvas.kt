@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,8 +24,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,6 +46,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -52,6 +56,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.example.dsp.BackgroundEmitter
+import com.example.dsp.BackgroundEmitterTracker
 import com.example.dsp.BayesianGridFilter
 import com.example.dsp.EmitterShapeStage
 import com.example.dsp.EmitterTransport
@@ -63,6 +68,7 @@ import com.example.maps.OfflineMapTileManager
 import com.example.maps.TileBounds
 import com.example.maps.TileCacheState
 import com.example.maps.TileCoord
+import com.example.sensors.CellTowerInfo
 import com.example.ui.theme.CharcoalSurface
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.ObsidianBackground
@@ -85,6 +91,27 @@ import kotlin.math.hypot
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
+
+object RadarViewportMath {
+    const val MIN_ZOOM_WIDTH_M = 5.0f
+    const val MAX_ZOOM_WIDTH_M = 200.0f
+
+    fun worldToScreenPx(
+        wx: Double,
+        wy: Double,
+        cameraCenterX: Double,
+        cameraCenterY: Double,
+        viewportWidthMeters: Float,
+        canvasWidthPx: Float,
+        canvasHeightPx: Float
+    ): Pair<Float, Float> {
+        val safeZoom = viewportWidthMeters.coerceIn(MIN_ZOOM_WIDTH_M, MAX_ZOOM_WIDTH_M)
+        val metersToPx = if (canvasWidthPx > 0f) canvasWidthPx / safeZoom else 1f
+        val px = ((wx - cameraCenterX) * metersToPx + canvasWidthPx * 0.5f).toFloat()
+        val py = (canvasHeightPx * 0.5f - (wy - cameraCenterY) * metersToPx).toFloat()
+        return px to py
+    }
+}
 
 private data class LoadedMapTile(
     val coord: TileCoord,
@@ -112,10 +139,19 @@ fun RadarCanvas(
     lockedTargetLabel: String?,
     backgroundEmitters: List<BackgroundEmitter>,
     showBackgroundPins: Boolean,
+    showLabels: Boolean = true,
+    followMeEnabled: Boolean = true,
+    zoomWidthMeters: Float = 50.0f,
+    lockedCellTower: CellTowerInfo? = null,
+    perimeterEnabled: Boolean = false,
+    perimeterRadiusMeters: Float = 15.0f,
     sweepCoachState: SweepCoachState,
     tileCacheState: TileCacheState,
     mapOverlayEnabled: Boolean,
     offlineMapTileManager: OfflineMapTileManager,
+    onDisableFollowMe: () -> Unit = {},
+    onEnableFollowMe: () -> Unit = {},
+    onZoomWidthChange: (Float) -> Unit = {},
     onTapBackgroundEmitter: (BackgroundEmitter) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -185,11 +221,33 @@ fun RadarCanvas(
 
     var legendExpanded by remember { mutableStateOf(false) }
     val tapRadiusPx = with(LocalDensity.current) { 28.dp.toPx() }
+    var cameraOffsetXMeters by remember { mutableDoubleStateOf(0.0) }
+    var cameraOffsetYMeters by remember { mutableDoubleStateOf(0.0) }
+
+    LaunchedEffect(followMeEnabled) {
+        if (followMeEnabled) {
+            cameraOffsetXMeters = 0.0
+            cameraOffsetYMeters = 0.0
+        }
+    }
+
+    val latestFollowMe by rememberUpdatedState(followMeEnabled)
+    val latestZoomWidth by rememberUpdatedState(zoomWidthMeters)
+    val latestOnDisableFollowMe by rememberUpdatedState(onDisableFollowMe)
+    val latestOnZoomWidthChange by rememberUpdatedState(onZoomWidthChange)
+    val labelPaint = remember {
+        android.graphics.Paint().apply {
+            isAntiAlias = true
+            color = android.graphics.Color.argb(235, 224, 242, 254)
+            textSize = 23f
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+    }
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .aspectRatio(1f)
             .clip(RoundedCornerShape(14.dp))
             .background(ObsidianBackground)
             .border(1.dp, TacticalOutline, RoundedCornerShape(14.dp))
@@ -206,19 +264,52 @@ fun RadarCanvas(
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        val width = size.width.toFloat()
+                        if (width <= 0f) return@detectTransformGestures
+                        var currentZoom = latestZoomWidth.coerceIn(
+                            RadarViewportMath.MIN_ZOOM_WIDTH_M,
+                            RadarViewportMath.MAX_ZOOM_WIDTH_M
+                        )
+                        if (kotlin.math.abs(zoom - 1f) > 0.005f) {
+                            currentZoom = (currentZoom / zoom).coerceIn(
+                                RadarViewportMath.MIN_ZOOM_WIDTH_M,
+                                RadarViewportMath.MAX_ZOOM_WIDTH_M
+                            )
+                            latestOnZoomWidthChange(currentZoom)
+                        }
+                        if (pan.getDistance() > 1.5f) {
+                            if (latestFollowMe) {
+                                latestOnDisableFollowMe()
+                            }
+                            val mToPx = width / currentZoom
+                            cameraOffsetXMeters -= pan.x / mToPx
+                            cameraOffsetYMeters += pan.y / mToPx
+                        }
+                    }
+                }
                 .pointerInput(backgroundEmitters, showBackgroundPins) {
                     detectTapGestures { tapOffset ->
                         if (!showBackgroundPins || backgroundEmitters.isEmpty()) return@detectTapGestures
-                        val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS.toFloat()
                         val width = size.width.toFloat()
                         val height = size.height.toFloat()
                         if (width <= 0f || height <= 0f) return@detectTapGestures
+                        val camX = userPose.xMeters + if (latestFollowMe) 0.0 else cameraOffsetXMeters
+                        val camY = userPose.yMeters + if (latestFollowMe) 0.0 else cameraOffsetYMeters
 
                         var nearest: BackgroundEmitter? = null
                         var bestDist = tapRadiusPx
                         for (emitter in backgroundEmitters) {
-                            val ex = (emitter.estimatedX / arenaSize).coerceIn(0f, 1f) * width
-                            val ey = (1f - (emitter.estimatedY / arenaSize).coerceIn(0f, 1f)) * height
+                            val (ex, ey) = RadarViewportMath.worldToScreenPx(
+                                wx = emitter.estimatedX.toDouble(),
+                                wy = emitter.estimatedY.toDouble(),
+                                cameraCenterX = camX,
+                                cameraCenterY = camY,
+                                viewportWidthMeters = latestZoomWidth,
+                                canvasWidthPx = width,
+                                canvasHeightPx = height
+                            )
                             val d = hypot(tapOffset.x - ex, tapOffset.y - ey)
                             if (d <= bestDist) {
                                 bestDist = d
@@ -233,11 +324,24 @@ fun RadarCanvas(
         ) {
             val w = size.width
             val h = size.height
-            val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS.toFloat()
+            val safeZoomWidth = zoomWidthMeters.coerceIn(
+                RadarViewportMath.MIN_ZOOM_WIDTH_M,
+                RadarViewportMath.MAX_ZOOM_WIDTH_M
+            )
+            val metersToPx = w / safeZoomWidth
+            val camX = userPose.xMeters + if (followMeEnabled) 0.0 else cameraOffsetXMeters
+            val camY = userPose.yMeters + if (followMeEnabled) 0.0 else cameraOffsetYMeters
 
             fun worldToPx(wx: Double, wy: Double): Offset {
-                val px = ((wx / arenaSize).coerceIn(-0.5, 1.5) * w).toFloat()
-                val py = ((1.0 - (wy / arenaSize).coerceIn(-0.5, 1.5)) * h).toFloat()
+                val (px, py) = RadarViewportMath.worldToScreenPx(
+                    wx = wx,
+                    wy = wy,
+                    cameraCenterX = camX,
+                    cameraCenterY = camY,
+                    viewportWidthMeters = safeZoomWidth,
+                    canvasWidthPx = w,
+                    canvasHeightPx = h
+                )
                 return Offset(px, py)
             }
 
@@ -256,12 +360,12 @@ fun RadarCanvas(
                         anchorLat = anchorGps.latitude,
                         anchorLon = anchorGps.longitude
                     )
-                    val leftPx = ((westX / arenaSize) * w).roundToInt()
-                    val rightPx = ((eastX / arenaSize) * w).roundToInt()
-                    val topPx = ((1.0 - northY / arenaSize) * h).roundToInt()
-                    val bottomPx = ((1.0 - southY / arenaSize) * h).roundToInt()
-                    val dstW = (rightPx - leftPx).coerceAtLeast(1)
-                    val dstH = (bottomPx - topPx).coerceAtLeast(1)
+                    val topLeft = worldToPx(westX, northY)
+                    val bottomRight = worldToPx(eastX, southY)
+                    val leftPx = topLeft.x.roundToInt()
+                    val topPx = topLeft.y.roundToInt()
+                    val dstW = (bottomRight.x.roundToInt() - leftPx).coerceAtLeast(1)
+                    val dstH = (bottomRight.y.roundToInt() - topPx).coerceAtLeast(1)
 
                     drawImage(
                         image = tile.imageBitmap,
@@ -273,19 +377,37 @@ fun RadarCanvas(
                 }
             }
 
-            // 2. 5m Tactical Grid Lines
-            val gridSteps = 10
-            for (i in 1 until gridSteps) {
-                val frac = i.toFloat() / gridSteps
-                val stroke = if (i == 5) 1.5f else 0.8f
-                val color = if (i == 5) TacticalOutline else TacticalGridLine.copy(alpha = 0.72f)
-                drawLine(color = color, start = Offset(w * frac, 0f), end = Offset(w * frac, h), strokeWidth = stroke)
-                drawLine(color = color, start = Offset(0f, h * frac), end = Offset(w, h * frac), strokeWidth = stroke)
+            // 2. Dynamic 5m Tactical World Grid Lines
+            val halfW = safeZoomWidth * 0.5
+            val halfH = (h / metersToPx) * 0.5
+            val minGridX = kotlin.math.floor((camX - halfW) / 5.0).toInt() * 5
+            val maxGridX = kotlin.math.ceil((camX + halfW) / 5.0).toInt() * 5
+            val minGridY = kotlin.math.floor((camY - halfH) / 5.0).toInt() * 5
+            val maxGridY = kotlin.math.ceil((camY + halfH) / 5.0).toInt() * 5
+
+            for (gx in minGridX..maxGridX step 5) {
+                val px = worldToPx(gx.toDouble(), camY).x
+                val isMajor = gx == 25 || gx % 25 == 0
+                drawLine(
+                    color = if (isMajor) TacticalOutline else TacticalGridLine.copy(alpha = 0.72f),
+                    start = Offset(px, 0f),
+                    end = Offset(px, h),
+                    strokeWidth = if (isMajor) 1.5f else 0.8f
+                )
+            }
+            for (gy in minGridY..maxGridY step 5) {
+                val py = worldToPx(camX, gy.toDouble()).y
+                val isMajor = gy == 25 || gy % 25 == 0
+                drawLine(
+                    color = if (isMajor) TacticalOutline else TacticalGridLine.copy(alpha = 0.72f),
+                    start = Offset(0f, py),
+                    end = Offset(w, py),
+                    strokeWidth = if (isMajor) 1.5f else 0.8f
+                )
             }
 
-            // 3. Concentric Range Rings (5m, 10m, 15m, 20m around center)
-            val centerPx = Offset(w * 0.5f, h * 0.5f)
-            val metersToPx = w / arenaSize
+            // 3. Concentric Range Rings (5m, 10m, 15m, 20m around user)
+            val userRingCenter = worldToPx(userPose.xMeters, userPose.yMeters)
             val ringStroke = Stroke(
                 width = 1.1f,
                 pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
@@ -294,17 +416,73 @@ fun RadarCanvas(
                 drawCircle(
                     color = TacticalOutline.copy(alpha = 0.65f),
                     radius = radiusMeters * metersToPx,
-                    center = centerPx,
+                    center = userRingCenter,
                     style = ringStroke
                 )
             }
 
-            // 4. Thermal Plasma Bayesian Probability Heatmap
+            // 3b. Virtual Perimeter Guard Bubble
+            if (perimeterEnabled) {
+                drawCircle(
+                    color = ThermalAmber.copy(alpha = 0.75f),
+                    radius = perimeterRadiusMeters * metersToPx,
+                    center = userRingCenter,
+                    style = Stroke(
+                        width = 2.2f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f)
+                    )
+                )
+            }
+
+            // 3c. Cell Tower SAR + Timing Advance (TA) Range Arcs
+            if (lockedCellTower != null) {
+                val taDist = lockedCellTower.timingAdvanceDistanceMeters
+                val rsrp = lockedCellTower.rsrpDbm
+                val sarRingMeters = if (rsrp != null) {
+                    val est = BackgroundEmitterTracker.estimateDistanceMeters(
+                        kalmanRssiDbm = rsrp.toDouble(),
+                        txPowerP0Dbm = -30.0,
+                        pathLossExponentN = 2.8
+                    )
+                    est.toFloat().coerceIn(8f, 120f)
+                } else {
+                    25f
+                }
+                drawCircle(
+                    color = SignalEmerald.copy(alpha = 0.75f),
+                    radius = sarRingMeters * metersToPx,
+                    center = userRingCenter,
+                    style = Stroke(width = 2.5f)
+                )
+                if (taDist != null && taDist > 0f) {
+                    val taRadiusPx = (taDist * metersToPx).coerceAtMost(w * 2.5f)
+                    drawCircle(
+                        color = ElectricCyan.copy(alpha = 0.6f),
+                        radius = taRadiusPx,
+                        center = userRingCenter,
+                        style = Stroke(
+                            width = 2.0f,
+                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 10f), 0f)
+                        )
+                    )
+                }
+            }
+
+            // 4. Thermal Plasma Bayesian Probability Heatmap anchored at (gridOriginX, gridOriginY)
             if (hasLockedTarget && gridSnapshot.updateCount > 0L) {
+                val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS
+                val originX = gridSnapshot.gridOriginX.toDouble()
+                val originY = gridSnapshot.gridOriginY.toDouble()
+                val gridTopLeft = worldToPx(originX, originY + arenaSize)
+                val gridBottomRight = worldToPx(originX + arenaSize, originY)
+                val gLeft = gridTopLeft.x.roundToInt()
+                val gTop = gridTopLeft.y.roundToInt()
+                val gW = (gridBottomRight.x.roundToInt() - gLeft).coerceAtLeast(1)
+                val gH = (gridBottomRight.y.roundToInt() - gTop).coerceAtLeast(1)
                 drawImage(
                     image = imageBitmap,
-                    dstOffset = IntOffset.Zero,
-                    dstSize = IntSize(w.toInt(), h.toInt()),
+                    dstOffset = IntOffset(gLeft, gTop),
+                    dstSize = IntSize(gW, gH),
                     filterQuality = FilterQuality.Medium
                 )
             }
@@ -322,6 +500,7 @@ fun RadarCanvas(
 
             // 6. 6-Stage Background Emitter Shapes (Semicircle -> Hexagon -> Pinned)
             if (showBackgroundPins) {
+                val shapeScale = if (safeZoomWidth <= 15.0f) 1.45f else 1.0f
                 for (emitter in backgroundEmitters) {
                     val isCurrentlyLocked = (lockedTargetMac != null && emitter.latestMacAddress == lockedTargetMac) ||
                         (lockedTargetFingerprint != null && emitter.fingerprintHash == lockedTargetFingerprint)
@@ -329,8 +508,19 @@ fun RadarCanvas(
                     drawBackgroundEmitterShape(
                         emitter = emitter,
                         center = pos,
-                        isLocked = isCurrentlyLocked
+                        isLocked = isCurrentlyLocked,
+                        scale = shapeScale
                     )
+                    if (showLabels) {
+                        val shortName = emitter.displayName.take(12)
+                        val rssiTag = "${emitter.kalmanRssiDbm.roundToInt()}dBm"
+                        drawContext.canvas.nativeCanvas.drawText(
+                            "$shortName · $rssiTag",
+                            pos.x,
+                            pos.y + (26f * shapeScale),
+                            labelPaint
+                        )
+                    }
                 }
             }
 
@@ -496,6 +686,20 @@ fun RadarCanvas(
             // Crisp center anchor pip
             drawCircle(color = ObsidianBackground, radius = 4.2f, center = userPx)
             drawCircle(color = ReadoutInkPrimary, radius = 2.2f, center = userPx)
+
+            // Edge indicator arrow toward operator when panned off-screen
+            if (userPx.x < 0f || userPx.x > w || userPx.y < 0f || userPx.y > h) {
+                val dx = userPx.x - w * 0.5f
+                val dy = userPx.y - h * 0.5f
+                val angle = kotlin.math.atan2(dy, dx)
+                val edgeR = kotlin.math.min(w, h) * 0.44f
+                val ex = w * 0.5f + edgeR * cos(angle)
+                val ey = h * 0.5f + edgeR * sin(angle)
+                val edgeTip = Offset(ex, ey)
+                val arrowBack = Offset(ex - 16f * cos(angle), ey - 16f * sin(angle))
+                drawLine(ElectricCyan, arrowBack, edgeTip, strokeWidth = 5f, cap = StrokeCap.Round)
+                drawCircle(ElectricCyan, radius = 6f, center = edgeTip)
+            }
         }
 
         // Cardinal Compass Labels (N / S / E / W)
@@ -545,7 +749,7 @@ fun RadarCanvas(
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Text(
-                text = "50×50m",
+                text = "${zoomWidthMeters.roundToInt()}×${zoomWidthMeters.roundToInt()}m",
                 style = MaterialTheme.typography.labelSmall,
                 color = ReadoutInkSecondary
             )
@@ -595,6 +799,31 @@ fun RadarCanvas(
                     text = "OSM ${loadedTiles.size}T",
                     style = MaterialTheme.typography.labelSmall,
                     color = SignalEmerald
+                )
+            }
+        }
+
+        // Floating RE-CENTER pill when panned away from Follow Me
+        if (!followMeEnabled || cameraOffsetXMeters != 0.0 || cameraOffsetYMeters != 0.0) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 24.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(ElectricCyan)
+                    .border(1.5.dp, ObsidianBackground, RoundedCornerShape(20.dp))
+                    .clickable {
+                        cameraOffsetXMeters = 0.0
+                        cameraOffsetYMeters = 0.0
+                        onEnableFollowMe()
+                    }
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+                    .testTag("radar_recenter_button")
+            ) {
+                Text(
+                    text = "⌖ RE-CENTER",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ObsidianBackground
                 )
             }
         }
@@ -846,7 +1075,8 @@ private fun DrawScope.drawAnchorPin(center: Offset, fill: Color) {
 private fun DrawScope.drawBackgroundEmitterShape(
     emitter: BackgroundEmitter,
     center: Offset,
-    isLocked: Boolean
+    isLocked: Boolean,
+    scale: Float = 1.0f
 ) {
     val baseColor = when {
         emitter.shapeStage == EmitterShapeStage.PINNED -> SignalEmerald
@@ -856,9 +1086,9 @@ private fun DrawScope.drawBackgroundEmitterShape(
         else -> ThermalAmber
     }
     val radius = when (emitter.shapeStage) {
-        EmitterShapeStage.PINNED -> 12f
-        EmitterShapeStage.HEXAGON -> 10.5f
-        else -> 9.5f
+        EmitterShapeStage.PINNED -> 12f * scale
+        EmitterShapeStage.HEXAGON -> 10.5f * scale
+        else -> 9.5f * scale
     }
 
     drawGeometricStageMarker(

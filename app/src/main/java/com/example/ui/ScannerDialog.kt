@@ -87,6 +87,7 @@ import java.util.Locale
 
 enum class ScannerFilterTab(val label: String) {
     ALL("All"),
+    DRONES("Drones"),
     RTT("RTT"),
     BLE("BLE"),
     WIFI("Wi-Fi"),
@@ -115,7 +116,51 @@ fun ScannerDialog(
     onRefreshWifiScan: () -> Unit,
     onRefreshCellular: () -> Unit,
     onRequestPhoneStatePermission: () -> Unit,
+    onTrackTowerOnRadar: (CellTowerInfo) -> Unit = {},
     onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.95f)
+                .fillMaxHeight(0.86f)
+                .border(1.dp, TacticalOutline, RoundedCornerShape(16.dp)),
+            shape = RoundedCornerShape(16.dp),
+            color = CharcoalSurface
+        ) {
+            ScannerTabContent(
+                emitters = emitters,
+                cellularSnapshot = cellularSnapshot,
+                lockedTargetMac = lockedTargetMac,
+                onInspectEmitter = onInspectEmitter,
+                onLockEmitter = onLockEmitter,
+                onRefreshWifiScan = onRefreshWifiScan,
+                onRefreshCellular = onRefreshCellular,
+                onRequestPhoneStatePermission = onRequestPhoneStatePermission,
+                onTrackTowerOnRadar = onTrackTowerOnRadar,
+                onDismiss = onDismiss,
+                modifier = Modifier.padding(14.dp)
+            )
+        }
+    }
+}
+
+@Composable
+fun ScannerTabContent(
+    emitters: List<DiscoveredEmitter>,
+    cellularSnapshot: CellularSnapshot,
+    lockedTargetMac: String?,
+    onInspectEmitter: (DiscoveredEmitter) -> Unit,
+    onLockEmitter: (DiscoveredEmitter) -> Unit,
+    onRefreshWifiScan: () -> Unit,
+    onRefreshCellular: () -> Unit,
+    onRequestPhoneStatePermission: () -> Unit,
+    onTrackTowerOnRadar: (CellTowerInfo) -> Unit = {},
+    onDismiss: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
 ) {
     var selectedTab by remember { mutableStateOf(ScannerFilterTab.ALL) }
     var selectedCellTower by remember { mutableStateOf<CellTowerInfo?>(null) }
@@ -134,12 +179,12 @@ fun ScannerDialog(
         }
     }
 
-    // 2.5-second auto-freeze cooldown after touch/scroll stops
+    // 3.0-second auto-freeze cooldown after touch/scroll stops (prevents rapid flicker)
     LaunchedEffect(lastInteractionToken, listState.isScrollInProgress) {
         if (listState.isScrollInProgress) {
             touchFrozen = true
         } else if (touchFrozen) {
-            delay(2_500L)
+            delay(3_000L)
             touchFrozen = false
         }
     }
@@ -154,6 +199,7 @@ fun ScannerDialog(
     val displayedEmitters = remember(frozenSnapshot, selectedTab) {
         when (selectedTab) {
             ScannerFilterTab.ALL -> frozenSnapshot
+            ScannerFilterTab.DRONES -> frozenSnapshot.filter { it.isDroneSuspect }
             ScannerFilterTab.RTT -> frozenSnapshot.filter { it.isRttResponder }
             ScannerFilterTab.BLE -> frozenSnapshot.filter { it.transport == EmitterTransport.BLE }
             ScannerFilterTab.WIFI -> frozenSnapshot.filter { it.transport == EmitterTransport.WIFI }
@@ -162,19 +208,7 @@ fun ScannerDialog(
         }
     }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
-    ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth(0.95f)
-                .fillMaxHeight(0.86f)
-                .border(1.dp, TacticalOutline, RoundedCornerShape(16.dp)),
-            shape = RoundedCornerShape(16.dp),
-            color = CharcoalSurface
-        ) {
-            Column(modifier = Modifier.padding(14.dp)) {
+    Column(modifier = modifier) {
                 // Header Row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -236,7 +270,11 @@ fun ScannerDialog(
                                     modifier = Modifier.size(14.dp)
                                 )
                                 Text(
-                                    text = if (isEffectivelyFrozen) "FROZEN" else "LIVE",
+                                    text = when {
+                                        manualFrozen -> "PAUSED"
+                                        isEffectivelyFrozen -> "HOLD"
+                                        else -> "LIVE"
+                                    },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = freezeAccent
                                 )
@@ -263,17 +301,19 @@ fun ScannerDialog(
                         )
                     }
 
-                    IconButton(
-                        onClick = onDismiss,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("scanner_close_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Close,
-                            contentDescription = stringResource(R.string.cd_close_dialog),
-                            tint = ReadoutInkSecondary
-                        )
+                    if (onDismiss != null) {
+                        IconButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("scanner_close_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Close,
+                                contentDescription = stringResource(R.string.cd_close_dialog),
+                                tint = ReadoutInkSecondary
+                            )
+                        }
                     }
                 }
 
@@ -289,6 +329,7 @@ fun ScannerDialog(
                     ScannerFilterTab.entries.forEach { tab ->
                         val count = when (tab) {
                             ScannerFilterTab.ALL -> frozenSnapshot.size
+                            ScannerFilterTab.DRONES -> frozenSnapshot.count { it.isDroneSuspect }
                             ScannerFilterTab.RTT -> frozenSnapshot.count { it.isRttResponder }
                             ScannerFilterTab.BLE -> frozenSnapshot.count { it.transport == EmitterTransport.BLE }
                             ScannerFilterTab.WIFI -> frozenSnapshot.count { it.transport == EmitterTransport.WIFI }
@@ -385,7 +426,7 @@ fun ScannerDialog(
                     ) {
                         items(
                             items = displayedEmitters,
-                            key = { it.macAddress }
+                            key = { it.fingerprintHash }
                         ) { emitter ->
                             EmitterListRow(
                                 emitter = emitter,
@@ -397,15 +438,13 @@ fun ScannerDialog(
                     }
                 }
             }
-        }
-    }
-
     // Dedicated Plain-English Cellular Tower Dossier Sheet
     val inspectedTower = selectedCellTower
     if (inspectedTower != null) {
         CellTowerDossierSheet(
             tower = inspectedTower,
             cellularSnapshot = cellularSnapshot,
+            onTrackTowerOnRadar = onTrackTowerOnRadar,
             onDismiss = { selectedCellTower = null }
         )
     }
@@ -465,6 +504,15 @@ private fun EmitterListRow(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
+                if (emitter.isDroneSuspect) {
+                    MiniScannerBadge("[DRONE]", TacticalCrimson)
+                }
+                if (emitter.isEvilTwinSuspect) {
+                    MiniScannerBadge("[EVIL TWIN?]", TacticalCrimson)
+                }
+                if (emitter.isWatchlistMatch) {
+                    MiniScannerBadge("[WATCH]", ThermalAmber)
+                }
                 if (emitter.isRttResponder) {
                     MiniScannerBadge("[RTT]", SignalEmerald)
                 }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -15,11 +16,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CellTower
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fingerprint
@@ -27,6 +30,7 @@ import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Usb
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
@@ -35,10 +39,12 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -92,6 +98,8 @@ fun SignalDossierSheet(
     dossier: EmitterDossierData,
     onLockTarget: (EmitterDossierData) -> Unit,
     onUnlockTarget: () -> Unit,
+    onWatchFingerprint: (EmitterDossierData) -> Unit = {},
+    onToggleMute: (EmitterDossierData) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     Dialog(
@@ -134,20 +142,53 @@ fun SignalDossierSheet(
                     }
                     Spacer(modifier = Modifier.width(10.dp))
                     Column(modifier = Modifier.weight(1f)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = dossier.displayName,
+                                style = MaterialTheme.typography.titleMedium,
+                                color = ReadoutInkPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            dossier.estimatedDistanceMeters?.let { d ->
+                                Text(
+                                    text = String.format(Locale.US, "%.1f m", d),
+                                    style = TelemetrySubValueStyle,
+                                    color = SignalEmerald
+                                )
+                            }
+                        }
                         Text(
-                            text = dossier.displayName,
-                            style = MaterialTheme.typography.titleMedium,
-                            color = ReadoutInkPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = "${dossier.macAddress} · PASSIVE RF DOSSIER",
+                            text = buildString {
+                                append(dossier.transport.shortLabel)
+                                append(" · ")
+                                append(dossier.macAddress)
+                                append(" · ")
+                                append("${dossier.latestRawRssiDbm} dBm")
+                                dossier.bearingDegTrue?.let { append(" · ${it}°") }
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             color = ReadoutInkSecondary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            DossierBadgeChip(dossier.displayFingerprintId, ElectricCyan)
+                            dossier.primaryVendorLabel?.let { vendor ->
+                                DossierBadgeChip(vendor, ThermalAmber)
+                            }
+                            if (dossier.isRttResponder) {
+                                DossierBadgeChip("802.11mc RTT", SignalEmerald)
+                            }
+                        }
                     }
                     IconButton(
                         onClick = onDismiss,
@@ -163,49 +204,16 @@ fun SignalDossierSheet(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Prominent Primary Action: Lock 1m Radar Target (or Unlock if active)
-                Button(
-                    onClick = {
-                        if (dossier.isLocked) onUnlockTarget() else onLockTarget(dossier)
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (dossier.isLocked) TacticalCrimson else SignalEmerald,
-                        contentColor = ObsidianBackground
-                    ),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .minimumInteractiveComponentSize()
-                        .testTag("dossier_lock_target_button")
-                ) {
-                    Icon(
-                        imageVector = if (dossier.isLocked) Icons.Filled.LockOpen else Icons.Filled.GpsFixed,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = if (dossier.isLocked) {
-                            "LOCKED ON RADAR · TAP TO UNLOCK"
-                        } else {
-                            "LOCK 1m RADAR TARGET"
-                        },
-                        style = MaterialTheme.typography.labelLarge
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 HorizontalDivider(color = TacticalOutline)
 
-                // Scrollable Passive Telemetry & Forensics Body
+                // Scrollable Unified Deep SIGINT Forensic Body
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
                         .verticalScroll(rememberScrollState())
-                        .padding(top = 10.dp),
+                        .padding(top = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     // Potential Unwanted Tracker Warning Pill (Apple Find My Separated / SmartTag / Tile)
@@ -244,115 +252,117 @@ fun SignalDossierSheet(
                         }
                     }
 
-                    // Live Raw vs. Negative Kalman RSSI Sparkline
+                    // Live Raw vs. Negative Kalman RF Signal Envelope
                     RssiSparklineCard(
                         history = dossier.rssiHistory,
                         latestRawDbm = dossier.latestRawRssiDbm,
-                        latestKalmanDbm = dossier.latestKalmanRssiDbm
+                        latestKalmanDbm = dossier.latestKalmanRssiDbm,
+                        totalPackets = dossier.totalPacketCount
                     )
 
-                    // Timing & Geometry Telemetry Grid
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        DossierStatTile(
-                            label = "RATE",
-                            value = String.format(Locale.US, "%.1f Hz", dossier.packetRateHz),
-                            accent = ElectricCyan,
-                            modifier = Modifier.weight(1f)
+                    // SECTION 1: LOCALIZATION & CONVERGENCE
+                    ForensicSectionCard(title = "LOCALIZATION & CONVERGENCE", accent = ElectricCyan) {
+                        val stageLabel = dossier.shapeStage?.let {
+                            "${it.spreadBandLabel} (${it.label}) • Spread ±${(dossier.angularSpreadDeg ?: 180f).toInt()}°"
+                        } ?: "180° Broad Sector • Spread ±180°"
+                        ForensicRow("Convergence Stage", stageLabel)
+                        ForensicRow(
+                            "Distance & Uncertainty",
+                            dossier.estimatedDistanceMeters?.let {
+                                String.format(Locale.US, "%.2f m", it)
+                            } ?: "--"
                         )
-                        DossierStatTile(
-                            label = "JITTER",
-                            value = String.format(Locale.US, "%.0f ms", dossier.interArrivalJitterMs),
-                            accent = ThermalAmber,
-                            modifier = Modifier.weight(1f)
+                        ForensicRow(
+                            "Bearing & Mode",
+                            "${dossier.bearingDegTrue?.let { "${it}° True" } ?: "--"} • ${dossier.localizationModeLabel} (${dossier.bearingConfidencePct}% conf)"
                         )
-                        DossierStatTile(
-                            label = "CLK SKEW",
-                            value = String.format(Locale.US, "%+.0f ppm", dossier.clockSkewPpm),
-                            accent = SignalEmerald,
-                            modifier = Modifier.weight(1f)
+                        ForensicRow(
+                            "SAR Aperture",
+                            String.format(Locale.US, "%.2f m baseline traversed", dossier.baselineMeters)
                         )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        DossierStatTile(
-                            label = "6-STAGE SHAPE",
-                            value = dossier.shapeStage?.let { "${it.label} (${it.spreadBandLabel})" } ?: "--",
-                            accent = if (dossier.isPinned) ThermalYellow else ElectricCyan,
-                            modifier = Modifier.weight(1f)
+                        ForensicRow(
+                            "Local ENU Coords",
+                            String.format(Locale.US, "E %+.2f m, N %+.2f m", dossier.enuEastMeters, dossier.enuNorthMeters)
                         )
-                        DossierStatTile(
-                            label = "EST RANGE",
-                            value = dossier.estimatedDistanceMeters?.let {
-                                String.format(Locale.US, "%.1f m", it)
-                            } ?: "--",
-                            accent = SignalEmerald,
-                            modifier = Modifier.weight(1f)
+                        ForensicRow(
+                            "WGS-84 Coords",
+                            if (dossier.wgs84Lat != null && dossier.wgs84Lon != null) {
+                                String.format(Locale.US, "%.6f, %.6f", dossier.wgs84Lat, dossier.wgs84Lon)
+                            } else {
+                                "Awaiting GPS anchor"
+                            }
+                        )
+                        ForensicRow(
+                            "Zone Status",
+                            when (dossier.isInsidePerimeter) {
+                                true -> "Perimeter: Inside • Active Geofences: ${dossier.activeGeofenceCount}"
+                                false -> "Perimeter: Outside • Active Geofences: ${dossier.activeGeofenceCount}"
+                                null -> "Perimeter: Standby • Active Geofences: ${dossier.activeGeofenceCount}"
+                            }
                         )
                     }
 
-                    // Fingerprint & MAC Rotation History Card
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(ElevatedSurface)
-                            .border(1.dp, TacticalOutline, RoundedCornerShape(10.dp))
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Fingerprint,
-                                contentDescription = null,
-                                tint = ThermalAmber,
-                                modifier = Modifier.size(16.dp)
+                    // SECTION 2: RF FINGERPRINT & TIMING
+                    ForensicSectionCard(title = "RF FINGERPRINT & TIMING", accent = ThermalAmber) {
+                        ForensicRow("Fingerprint Hash", "${dossier.displayFingerprintId} (${dossier.fingerprintHash})")
+                        ForensicRow("Protocol Profile", dossier.protocolProfile.ifBlank { dossier.transport.shortLabel })
+                        ForensicRow("Frequency / Channel", dossier.frequencyChannelLabel.ifBlank { "--" })
+                        ForensicRow("Capabilities / Payloads", dossier.capabilitiesSummary.ifBlank { "--" })
+                        ForensicRow(
+                            "Timing & Oscillator",
+                            String.format(
+                                Locale.US,
+                                "Δt %.1f ms • Jitter σ=%.1f ms • Skew %+.1f ppm",
+                                dossier.meanDeltaMs,
+                                dossier.interArrivalJitterMs,
+                                dossier.clockSkewPpm
                             )
-                            Text(
-                                text = "FINGERPRINT & MAC ROTATION HISTORY",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ThermalAmber
+                        )
+                        if (dossier.wifiIeTags.isNotEmpty()) {
+                            ForensicRow("Wi-Fi IE Tags", dossier.wifiIeTags.joinToString(", "))
+                        }
+                        if (dossier.wifiVendorOuis.isNotEmpty()) {
+                            ForensicRow(
+                                "Vendor OUIs",
+                                dossier.wifiVendorOuis.joinToString(", ") { "${it.first} (${it.second})" }
+                            )
+                        }
+                        dossier.wpsDeviceInfo?.let { wps ->
+                            ForensicRow("WPS Info", wps)
+                        }
+                    }
+
+                    // SECTION 3: THREAT & MAC HISTORY
+                    ForensicSectionCard(title = "THREAT & MAC HISTORY", accent = SignalEmerald) {
+                        val timeFmt = remember { java.text.SimpleDateFormat("HH:mm:ss", Locale.US) }
+                        val tailLabel = if (dossier.tailChaseScore > 0) {
+                            "Elevated (${dossier.tailChaseScore}/100) • Rotations: ${(dossier.macHistory.size - 1).coerceAtLeast(0)}"
+                        } else {
+                            "Clear (0/100) • Rotations: ${(dossier.macHistory.size - 1).coerceAtLeast(0)}"
+                        }
+                        ForensicRow("Tail-Chase Assessment", tailLabel)
+                        if (dossier.firstSeenEpochMs > 0L) {
+                            ForensicRow(
+                                "Timestamps",
+                                "First ${timeFmt.format(java.util.Date(dossier.firstSeenEpochMs))} • Last ${timeFmt.format(java.util.Date(dossier.lastSeenEpochMs))}"
                             )
                         }
                         Text(
-                            text = "ID: ${dossier.fingerprintHash}",
+                            text = "Linked MACs (${dossier.macHistory.size.coerceAtLeast(1)})",
                             style = MaterialTheme.typography.labelSmall,
-                            color = ReadoutInkPrimary
+                            color = ReadoutInkSecondary
                         )
                         if (dossier.macHistory.isEmpty()) {
-                            Text(
-                                text = "Current MAC: ${dossier.macAddress}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ReadoutInkSecondary
-                            )
+                            DossierBadgeChip(dossier.macAddress, ElectricCyan)
                         } else {
-                            dossier.macHistory.forEachIndexed { idx, rec ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(ObsidianBackground)
-                                        .padding(horizontal = 8.dp, vertical = 5.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = if (idx == 0) "${rec.macAddress} (ACTIVE)" else rec.macAddress,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (idx == 0) ElectricCyan else ReadoutInkSecondary
-                                    )
-                                    Text(
-                                        text = "${rec.lastRssiDbm} dBm",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = ReadoutInkMuted
+                            Row(
+                                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                dossier.macHistory.forEachIndexed { idx, rec ->
+                                    DossierBadgeChip(
+                                        text = "${rec.macAddress} (${rec.lastRssiDbm}dBm)",
+                                        accent = if (idx == 0) ElectricCyan else ReadoutInkSecondary
                                     )
                                 }
                             }
@@ -492,8 +502,169 @@ fun SignalDossierSheet(
                         )
                     }
                 }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                HorizontalDivider(color = TacticalOutline)
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Sticky Bottom Action Row: Fox Hunt / Watch / Mute
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            if (dossier.isLocked) onUnlockTarget() else onLockTarget(dossier)
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (dossier.isLocked) TacticalCrimson else SignalEmerald,
+                            contentColor = ObsidianBackground
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1.3f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("dossier_lock_target_button")
+                    ) {
+                        Icon(
+                            imageVector = if (dossier.isLocked) Icons.Filled.LockOpen else Icons.Filled.GpsFixed,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = if (dossier.isLocked) "Unlock" else "◎ Fox Hunt",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { onWatchFingerprint(dossier) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (dossier.isWatched) ThermalAmber else ElectricCyan.copy(alpha = 0.7f)
+                        ),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (dossier.isWatched) ThermalAmber.copy(alpha = 0.16f) else ObsidianBackground,
+                            contentColor = if (dossier.isWatched) ThermalAmber else ElectricCyan
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("dossier_watch_fingerprint_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Visibility,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (dossier.isWatched) "Watched" else "Watch",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { onToggleMute(dossier) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (dossier.isMuted) TacticalCrimson else TacticalOutline
+                        ),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (dossier.isMuted) TacticalCrimson.copy(alpha = 0.16f) else ObsidianBackground,
+                            contentColor = if (dossier.isMuted) TacticalCrimson else ReadoutInkSecondary
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("dossier_mute_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Block,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (dossier.isMuted) "Muted" else "Mute",
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1
+                        )
+                    }
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun DossierBadgeChip(text: String, accent: Color) {
+    Surface(
+        shape = RoundedCornerShape(6.dp),
+        color = accent.copy(alpha = 0.15f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.55f))
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            color = accent,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+        )
+    }
+}
+
+@Composable
+private fun ForensicSectionCard(
+    title: String,
+    accent: Color,
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(ElevatedSurface)
+            .border(1.dp, TacticalOutline, RoundedCornerShape(10.dp))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelSmall,
+            color = accent
+        )
+        content()
+    }
+}
+
+@Composable
+private fun ForensicRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = ReadoutInkMuted,
+            modifier = Modifier.padding(end = 8.dp)
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.labelSmall,
+            color = ReadoutInkPrimary,
+            modifier = Modifier.weight(1f, fill = false)
+        )
     }
 }
 
@@ -501,7 +672,8 @@ fun SignalDossierSheet(
 private fun RssiSparklineCard(
     history: List<RssiSamplePoint>,
     latestRawDbm: Int,
-    latestKalmanDbm: Float
+    latestKalmanDbm: Float,
+    totalPackets: Int = history.size
 ) {
     Column(
         modifier = Modifier
@@ -518,7 +690,7 @@ private fun RssiSparklineCard(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
-                text = "RSSI SPARKLINE (RAW vs KALMAN)",
+                text = "RF SIGNAL ENVELOPE · $totalPackets pkts",
                 style = MaterialTheme.typography.labelSmall,
                 color = ReadoutInkSecondary
             )
@@ -646,6 +818,7 @@ private fun DossierStatTile(
 fun CellTowerDossierSheet(
     tower: CellTowerInfo,
     cellularSnapshot: CellularSnapshot,
+    onTrackTowerOnRadar: (CellTowerInfo) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val genColor = when (tower.generation) {
@@ -738,6 +911,36 @@ fun CellTowerDossierSheet(
                             tint = ReadoutInkSecondary
                         )
                     }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        onTrackTowerOnRadar(tower)
+                        onDismiss()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SignalEmerald,
+                        contentColor = ObsidianBackground
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .minimumInteractiveComponentSize()
+                        .testTag("track_tower_on_radar_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.GpsFixed,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "TRACK TOWER ON RADAR (PCI ${tower.pci ?: "--"} · $bandLabel)",
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(10.dp))

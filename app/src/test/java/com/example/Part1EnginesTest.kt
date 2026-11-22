@@ -282,8 +282,8 @@ class Part1EnginesTest {
 
         val wideSnap = GridSnapshot.uniform().copy(cep95Meters = 8.0f, updateCount = 5L)
 
-        // Spin 280 degrees in 10-degree increments at Anchor A
-        for (deg in 0..280 step 10) {
+        // Spin 350 degrees in 10-degree increments at Anchor A
+        for (deg in 0..350 step 10) {
             pose = pose.copy(headingRad = Math.toRadians(deg.toDouble()))
             state = coach.update(pose, -62, wideSnap)
         }
@@ -294,13 +294,13 @@ class Part1EnginesTest {
         state = coach.update(pose, -60, wideSnap)
         assertEquals(SweepStage.SPIN_2, state.stage)
 
-        // Spin 280 degrees at Anchor B and converge CEP95 <= 1.5m
+        // Spin 350 degrees at Anchor B and converge CEP95 <= 1.5m
         val convergedSnap = wideSnap.copy(
             cep95Meters = 1.1f,
             updateCount = 14L,
             activeTier = LocalizationTier.SHIELD_TIER2
         )
-        for (deg in 0..280 step 10) {
+        for (deg in 0..350 step 10) {
             pose = pose.copy(headingRad = Math.toRadians(deg.toDouble()))
             state = coach.update(pose, -55, convergedSnap)
         }

@@ -32,11 +32,15 @@ import androidx.compose.material.icons.filled.BatterySaver
 import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.Flight
 import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
@@ -44,12 +48,16 @@ import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -70,6 +78,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -77,6 +86,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.data.ExportFormat
+import com.example.dsp.DroneDetectorEngine
 import com.example.dsp.HardwareStatus
 import com.example.dsp.LocalizationTier
 import com.example.dsp.MagneticFieldStatus
@@ -104,6 +114,7 @@ import com.example.ui.theme.ThermalAmber
 import com.example.ui.theme.ThermalYellow
 import java.util.Locale
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 @Composable
@@ -133,21 +144,72 @@ fun RadarScreen(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         bottomBar = {
             if (uiState.hasPermissions && uiState.hasCompletedFirstRunWalkthrough) {
-                CalibrationDrawer(
-                    calibration = uiState.calibration,
-                    activePresets = uiState.activePresets,
-                    expanded = calibrationExpanded,
-                    onToggleExpanded = { calibrationExpanded = !calibrationExpanded },
-                    onApplyShieldPreset = viewModel::applyShieldPreset,
-                    onToggleScreenOutward = viewModel::toggleScreenOutwardMode,
-                    onApplyEmitterClassPreset = viewModel::applyEmitterClassPreset,
-                    onApplyEnvironmentPreset = viewModel::applyEnvironmentPreset,
-                    onShieldDropChange = viewModel::updateShieldDropDb,
-                    onTxPowerChange = viewModel::updateTxPowerP0,
-                    onPathLossChange = viewModel::updatePathLossExponent,
-                    onStepLengthChange = viewModel::updateStepLengthMeters,
-                    onRestoreDefaults = viewModel::restoreDefaultCalibration
-                )
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    if (uiState.activeTab == MainTab.RADAR) {
+                        CalibrationDrawer(
+                            calibration = uiState.calibration,
+                            activePresets = uiState.activePresets,
+                            expanded = calibrationExpanded,
+                            onToggleExpanded = { calibrationExpanded = !calibrationExpanded },
+                            onApplyShieldPreset = viewModel::applyShieldPreset,
+                            onToggleScreenOutward = viewModel::toggleScreenOutwardMode,
+                            onApplyEmitterClassPreset = viewModel::applyEmitterClassPreset,
+                            onApplyEnvironmentPreset = viewModel::applyEnvironmentPreset,
+                            onShieldDropChange = viewModel::updateShieldDropDb,
+                            onTxPowerChange = viewModel::updateTxPowerP0,
+                            onPathLossChange = viewModel::updatePathLossExponent,
+                            onStepLengthChange = viewModel::updateStepLengthMeters,
+                            onRestoreDefaults = viewModel::restoreDefaultCalibration
+                        )
+                    }
+                    NavigationBar(
+                        containerColor = CharcoalSurface,
+                        contentColor = ReadoutInkPrimary
+                    ) {
+                        NavigationBarItem(
+                            selected = uiState.activeTab == MainTab.RADAR,
+                            onClick = { viewModel.selectTab(MainTab.RADAR) },
+                            icon = { Icon(Icons.Filled.Radar, contentDescription = null) },
+                            label = { Text("Radar", maxLines = 1) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = ElectricCyan,
+                                selectedTextColor = ElectricCyan,
+                                unselectedIconColor = ReadoutInkSecondary,
+                                unselectedTextColor = ReadoutInkSecondary,
+                                indicatorColor = ElectricCyan.copy(alpha = 0.14f)
+                            ),
+                            modifier = Modifier.testTag("nav_tab_radar")
+                        )
+                        NavigationBarItem(
+                            selected = uiState.activeTab == MainTab.SIGNALS,
+                            onClick = { viewModel.selectTab(MainTab.SIGNALS) },
+                            icon = { Icon(Icons.Filled.Visibility, contentDescription = null) },
+                            label = { Text("Signals (${uiState.discoveredEmitters.size})", maxLines = 1) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = ElectricCyan,
+                                selectedTextColor = ElectricCyan,
+                                unselectedIconColor = ReadoutInkSecondary,
+                                unselectedTextColor = ReadoutInkSecondary,
+                                indicatorColor = ElectricCyan.copy(alpha = 0.14f)
+                            ),
+                            modifier = Modifier.testTag("nav_tab_signals")
+                        )
+                        NavigationBarItem(
+                            selected = uiState.activeTab == MainTab.PERIMETER_LOG,
+                            onClick = { viewModel.selectTab(MainTab.PERIMETER_LOG) },
+                            icon = { Icon(Icons.Filled.Security, contentDescription = null) },
+                            label = { Text("Perimeter", maxLines = 1) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = ThermalAmber,
+                                selectedTextColor = ThermalAmber,
+                                unselectedIconColor = ReadoutInkSecondary,
+                                unselectedTextColor = ReadoutInkSecondary,
+                                indicatorColor = ThermalAmber.copy(alpha = 0.14f)
+                            ),
+                            modifier = Modifier.testTag("nav_tab_perimeter")
+                        )
+                    }
+                }
             }
         }
     ) { innerPadding ->
@@ -168,99 +230,252 @@ fun RadarScreen(
                     .padding(innerPadding)
             )
         } else {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .widthIn(max = 600.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    // 1. Top Tactical HUD (Compass Rose, MAG µT, GNSS RF, Bg Pins, Carrying Mode, Screen Outward, TURBO/ECO, Geiger, ?, History)
-                    TopTacticalHud(
-                        uiState = uiState,
-                        onToggleBackgroundPins = viewModel::toggleBackgroundPins,
-                        onCycleCarryingMode = viewModel::cycleQuickCarryingMode,
-                        onToggleScreenOutward = viewModel::toggleScreenOutwardMode,
-                        onTogglePowerMode = viewModel::togglePowerMode,
-                        onToggleGeiger = viewModel::toggleGeigerFeedback,
-                        onOpenFieldGuide = { showFieldGuideDialog = true },
-                        onOpenSessionLog = { showSessionLogDialog = true },
-                        onResetGnssBaseline = viewModel::resetGnssBaseline
-                    )
+            when (uiState.activeTab) {
+                MainTab.RADAR -> {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .widthIn(max = 600.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            // 1. Top Tactical HUD (Row 1: Read-only hardware pills + Row 2: Single scrollable action chip bar)
+                            TopTacticalHud(
+                                uiState = uiState,
+                                onToggleBackgroundPins = viewModel::toggleBackgroundPins,
+                                onToggleLabels = viewModel::toggleLabels,
+                                onToggleFollowMe = { viewModel.setFollowMeEnabled(!uiState.followMeEnabled) },
+                                onCycleZoom = viewModel::cycleRadarZoom,
+                                onCycleCarryingMode = viewModel::cycleQuickCarryingMode,
+                                onToggleScreenOutward = viewModel::toggleScreenOutwardMode,
+                                onToggleMapOverlay = viewModel::toggleMapOverlay,
+                                onCacheArea = { viewModel.cacheOfflineMapArea() },
+                                onTogglePowerMode = viewModel::togglePowerMode,
+                                onToggleGeiger = viewModel::toggleGeigerFeedback,
+                                onOpenFieldGuide = { showFieldGuideDialog = true },
+                                onResetGnssBaseline = viewModel::resetGnssBaseline
+                            )
 
-                    // 2. Target Lock Pill + Guided Two-Spin Coach Banner (compact when idle; full coach when locked)
-                    if (uiState.lockedTargetMac != null) {
-                        TargetSelectorAndCoachBanner(
-                            uiState = uiState,
-                            onOpenScanner = { showScannerDialog = true },
-                            onUnlockTarget = viewModel::unlockTarget
-                        )
-                    }
-
-                    // 3. Offline Map Controls Bar (Map ON/OFF + Cache Area)
-                    OfflineMapControlsStrip(
-                        mapOverlayEnabled = uiState.mapOverlayEnabled,
-                        tileCacheState = uiState.tileCacheState,
-                        onToggleMapOverlay = viewModel::toggleMapOverlay,
-                        onCacheArea = { viewModel.cacheOfflineMapArea() }
-                    )
-
-                    // 4. Primary 100x100 Bayesian Thermal Plasma Radar Canvas + OSM + 6-Stage Shapes + Top-Layer Player Reticle
-                    RadarCanvas(
-                        gridSnapshot = uiState.gridSnapshot,
-                        userPose = uiState.userPose,
-                        hasLockedTarget = uiState.lockedTargetMac != null,
-                        lockedTargetMac = uiState.lockedTargetMac,
-                        lockedTargetFingerprint = uiState.lockedTargetFingerprint,
-                        lockedTargetLabel = uiState.lockedTargetName,
-                        backgroundEmitters = uiState.backgroundEmitters,
-                        showBackgroundPins = uiState.showBackgroundPins,
-                        sweepCoachState = uiState.sweepCoachState,
-                        tileCacheState = uiState.tileCacheState,
-                        mapOverlayEnabled = uiState.mapOverlayEnabled,
-                        offlineMapTileManager = viewModel.offlineMapTileManager,
-                        onTapBackgroundEmitter = { emitter ->
-                            viewModel.openDossierForBackgroundEmitter(emitter)
-                        }
-                    )
-
-                    // 5. Monospaced Telemetry Readout Strip
-                    TelemetryGridStrip(uiState = uiState)
-
-                    // 6. Prominent Unmistakable Primary SCAN SIGNALS (N) CTA Button (always visible without scrolling)
-                    PrimaryScanSignalsButton(
-                        activeEmitterCount = uiState.discoveredEmitters.size,
-                        cellTowerCount = uiState.cellularSnapshot.towers.size,
-                        hasLockedTarget = uiState.lockedTargetMac != null,
-                        onOpenScanner = { showScannerDialog = true }
-                    )
-
-                    // 7. Tactical Action Row (Zero Heading, Reset Grid, Save & Pin Snapshot)
-                    TacticalActionRow(
-                        hasLockedTarget = uiState.lockedTargetMac != null,
-                        isHeadingZeroed = uiState.userPose.isHeadingZeroed,
-                        onZeroHeading = {
-                            if (uiState.userPose.isHeadingZeroed) {
-                                viewModel.clearHeadingOffset()
-                            } else {
-                                viewModel.zeroHeading()
+                            // Always-on Crimson DRONE DETECTED Banner
+                            val droneBanner = uiState.droneAlertBanner
+                            if (droneBanner != null) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(TacticalCrimson.copy(alpha = 0.22f))
+                                        .border(1.dp, TacticalCrimson, RoundedCornerShape(10.dp))
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                        .testTag("drone_detected_banner"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Flight,
+                                        contentDescription = null,
+                                        tint = TacticalCrimson,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = droneBanner,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ReadoutInkPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        if (uiState.lockedTargetMac != null) {
+                                            val groundDist = DroneDetectorEngine.slantToGroundDistance(
+                                                uiState.gridSnapshot.estimatedDistanceMeters.toDouble(),
+                                                uiState.droneSlantAltitudeMeters.toDouble()
+                                            )
+                                            Text(
+                                                text = String.format(
+                                                    Locale.US,
+                                                    "3D Slant %.1fm -> Ground %.1fm (Alt %.0fm)",
+                                                    uiState.gridSnapshot.estimatedDistanceMeters,
+                                                    groundDist,
+                                                    uiState.droneSlantAltitudeMeters
+                                                ),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = ThermalAmber
+                                            )
+                                        }
+                                    }
+                                    Surface(
+                                        onClick = viewModel::lockTopDrone,
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = TacticalCrimson
+                                    ) {
+                                        Text(
+                                            text = "TRACK DRONE",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = ReadoutInkPrimary,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                        )
+                                    }
+                                }
                             }
+
+                            // Watchlist Hit Banner
+                            val wlBanner = uiState.watchlistHitBanner
+                            if (wlBanner != null) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(ThermalAmber.copy(alpha = 0.20f))
+                                        .border(1.dp, ThermalAmber, RoundedCornerShape(10.dp))
+                                        .clickable { viewModel.dismissWatchlistBanner() }
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                        .testTag("watchlist_hit_banner"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(Icons.Filled.Warning, contentDescription = null, tint = ThermalAmber, modifier = Modifier.size(16.dp))
+                                    Text(
+                                        text = wlBanner,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = ReadoutInkPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+
+                            // 2. Target Lock Pill + Guided Two-Spin Coach Banner
+                            if (uiState.lockedTargetMac != null) {
+                                TargetSelectorAndCoachBanner(
+                                    uiState = uiState,
+                                    onOpenScanner = { viewModel.selectTab(MainTab.SIGNALS) },
+                                    onUnlockTarget = viewModel::unlockTarget
+                                )
+                            }
+
+                            // Optional Cell Tower SAR/TA Lock Strip
+                            val towerLock = uiState.lockedCellTower
+                            if (towerLock != null) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(SignalEmerald.copy(alpha = 0.14f))
+                                        .border(1.dp, SignalEmerald.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "CELL TRACK: ${towerLock.generation.shortLabel} PCI ${towerLock.pci ?: "--"} · TA ${towerLock.timingAdvanceDistanceMeters?.roundToInt() ?: "--"}m",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SignalEmerald,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Text(
+                                        text = "CLEAR",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TacticalCrimson,
+                                        modifier = Modifier
+                                            .clickable(onClick = viewModel::unlockCellTower)
+                                            .padding(4.dp)
+                                    )
+                                }
+                            }
+
+                            // 3. Full-Height Bayesian Thermal Plasma Radar Canvas
+                            RadarCanvas(
+                                gridSnapshot = uiState.gridSnapshot,
+                                userPose = uiState.userPose,
+                                hasLockedTarget = uiState.lockedTargetMac != null,
+                                lockedTargetMac = uiState.lockedTargetMac,
+                                lockedTargetFingerprint = uiState.lockedTargetFingerprint,
+                                lockedTargetLabel = uiState.lockedTargetName,
+                                backgroundEmitters = uiState.backgroundEmitters,
+                                showBackgroundPins = uiState.showBackgroundPins,
+                                showLabels = uiState.showLabels,
+                                followMeEnabled = uiState.followMeEnabled,
+                                zoomWidthMeters = uiState.radarZoomWidthMeters,
+                                lockedCellTower = uiState.lockedCellTower,
+                                perimeterEnabled = uiState.perimeterEnabled,
+                                perimeterRadiusMeters = uiState.perimeterRadiusMeters,
+                                sweepCoachState = uiState.sweepCoachState,
+                                tileCacheState = uiState.tileCacheState,
+                                mapOverlayEnabled = uiState.mapOverlayEnabled,
+                                offlineMapTileManager = viewModel.offlineMapTileManager,
+                                onDisableFollowMe = { viewModel.setFollowMeEnabled(false) },
+                                onEnableFollowMe = { viewModel.setFollowMeEnabled(true) },
+                                onZoomWidthChange = viewModel::setRadarZoomWidth,
+                                onTapBackgroundEmitter = { emitter ->
+                                    viewModel.openDossierForBackgroundEmitter(emitter)
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                            )
+
+                            // 4. Compact Telemetry Readout Strip
+                            TelemetryGridStrip(uiState = uiState)
+
+                            // 5. Tactical Action Row (ZERO HDG, RST HEATMAP, PURGE SCANS, SAVE & PIN)
+                            TacticalActionRow(
+                                hasLockedTarget = uiState.lockedTargetMac != null,
+                                isHeadingZeroed = uiState.userPose.isHeadingZeroed,
+                                onZeroHeading = {
+                                    if (uiState.userPose.isHeadingZeroed) {
+                                        viewModel.clearHeadingOffset()
+                                    } else {
+                                        viewModel.zeroHeading()
+                                    }
+                                },
+                                onResetHeatmap = viewModel::resetHeatmapOnly,
+                                onPurgeScans = viewModel::purgeScans,
+                                onSaveSnapshot = viewModel::saveCurrentSnapshot
+                            )
+                        }
+                    }
+                }
+
+                MainTab.SIGNALS -> {
+                    SignalsAndWatchlistTab(
+                        uiState = uiState,
+                        onInspectEmitter = { emitter ->
+                            viewModel.openDossierForDiscoveredEmitter(emitter)
                         },
-                        onResetGrid = viewModel::resetGridAndPose,
-                        onSaveSnapshot = viewModel::saveCurrentSnapshot
+                        onLockEmitter = { emitter ->
+                            viewModel.lockTarget(emitter)
+                            viewModel.selectTab(MainTab.RADAR)
+                        },
+                        onRefreshWifiScan = viewModel::triggerManualWifiScan,
+                        onRefreshCellular = viewModel::refreshCellularMonitor,
+                        onRequestPhoneStatePermission = onRequestPhoneStatePermission,
+                        onTrackTowerOnRadar = viewModel::lockCellTower,
+                        onAddWatchlistEntry = viewModel::addWatchlistEntry,
+                        onDeleteWatchlistEntry = viewModel::deleteWatchlistEntry,
+                        modifier = Modifier.padding(innerPadding)
                     )
+                }
 
-                    // 8. Standalone Hardware Readiness Row
-                    HardwareReadinessRow(hardware = uiState.hardwareStatus)
-
-                    Spacer(modifier = Modifier.height(2.dp))
+                MainTab.PERIMETER_LOG -> {
+                    PerimeterAndLogTab(
+                        uiState = uiState,
+                        onSetPerimeterEnabled = viewModel::setPerimeterEnabled,
+                        onSetPerimeterRadius = viewModel::setPerimeterRadius,
+                        onSetPerimeterTriggerMode = viewModel::setPerimeterTriggerMode,
+                        onSetPerimeterScope = viewModel::setPerimeterScope,
+                        onClearPerimeterEvents = viewModel::clearPerimeterEvents,
+                        onCacheMapArea = { viewModel.cacheOfflineMapArea() },
+                        onExport = onRequestExportFile,
+                        onDeleteSnapshot = viewModel::deleteSnapshot,
+                        onClearAllSnapshots = viewModel::clearAllSnapshots,
+                        modifier = Modifier.padding(innerPadding)
+                    )
                 }
             }
         }
@@ -302,11 +517,16 @@ fun RadarScreen(
     if (activeDossier != null) {
         SignalDossierSheet(
             dossier = activeDossier,
-            onLockTarget = viewModel::lockTargetFromDossier,
+            onLockTarget = { dossier ->
+                viewModel.lockTargetFromDossier(dossier)
+                viewModel.selectTab(MainTab.RADAR)
+            },
             onUnlockTarget = {
                 viewModel.unlockTarget()
                 viewModel.closeDossier()
             },
+            onWatchFingerprint = viewModel::watchFingerprintFromDossier,
+            onToggleMute = { dossier -> viewModel.toggleMuteEmitter(dossier.fingerprintHash) },
             onDismiss = viewModel::closeDossier
         )
     }
@@ -334,12 +554,16 @@ fun RadarScreen(
 private fun TopTacticalHud(
     uiState: RadarUiState,
     onToggleBackgroundPins: () -> Unit,
+    onToggleLabels: () -> Unit,
+    onToggleFollowMe: () -> Unit,
+    onCycleZoom: () -> Unit,
     onCycleCarryingMode: () -> Unit,
     onToggleScreenOutward: () -> Unit,
+    onToggleMapOverlay: () -> Unit,
+    onCacheArea: () -> Unit,
     onTogglePowerMode: () -> Unit,
     onToggleGeiger: () -> Unit,
     onOpenFieldGuide: () -> Unit,
-    onOpenSessionLog: () -> Unit,
     onResetGnssBaseline: () -> Unit
 ) {
     Column(
@@ -351,7 +575,7 @@ private fun TopTacticalHud(
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // Row 1: Compass Rose + Digital Heading + Geiger + ? Guide + Session Log
+        // Row 1: Compass Rose + Digital Heading + Read-Only Hardware Pills (GPS, MAG, GNSS RF)
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -359,119 +583,71 @@ private fun TopTacticalHud(
         ) {
             MiniCompassRose(
                 userPose = uiState.userPose,
-                modifier = Modifier.size(34.dp)
+                modifier = Modifier.size(38.dp)
             )
-            Column(modifier = Modifier.weight(1f)) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text(
-                        text = String.format(
-                            Locale.US,
-                            "%03d° %s",
-                            uiState.userPose.compassDegrees,
-                            uiState.userPose.cardinalLabel
-                        ),
-                        style = TelemetryValueStyle,
-                        color = ElectricCyan
-                    )
-                    Text(
-                        text = "SIGSEEKER",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = ReadoutInkMuted
-                    )
-                }
+            Column(modifier = Modifier.padding(end = 4.dp)) {
                 Text(
-                    text = buildString {
-                        append(if (uiState.userPose.isHeadingZeroed) "Heading offset active" else "Magnetic North lock")
-                        if (uiState.activePresets.screenOutwardMode) append(" · +180° Outward")
+                    text = String.format(
+                        Locale.US,
+                        "%03d° %s",
+                        uiState.userPose.compassDegrees,
+                        uiState.userPose.cardinalLabel
+                    ),
+                    style = TelemetryValueStyle,
+                    color = ElectricCyan,
+                    maxLines = 1,
+                    softWrap = false
+                )
+                Text(
+                    text = if (uiState.activePresets.screenOutwardMode) {
+                        "Pocket +180°"
+                    } else if (uiState.userPose.isHeadingZeroed) {
+                        "Zeroed Hdg"
+                    } else {
+                        "Mag North"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = if (uiState.activePresets.screenOutwardMode) ThermalAmber else ReadoutInkSecondary,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    softWrap = false
                 )
             }
 
-            // Geiger Feedback Toggle with live pulse rate
-            Surface(
-                onClick = onToggleGeiger,
-                shape = RoundedCornerShape(8.dp),
-                color = if (uiState.isGeigerEnabled) ElectricCyan.copy(alpha = 0.20f) else ElevatedSurface,
-                border = BorderStroke(
-                    1.dp,
-                    if (uiState.isGeigerEnabled) ElectricCyan else TacticalOutline
-                ),
+            Row(
                 modifier = Modifier
-                    .minimumInteractiveComponentSize()
-                    .testTag("geiger_toggle_button")
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Icon(
-                        imageVector = if (uiState.isGeigerEnabled) {
-                            Icons.AutoMirrored.Filled.VolumeUp
-                        } else {
-                            Icons.AutoMirrored.Filled.VolumeOff
-                        },
-                        contentDescription = stringResource(R.string.cd_geiger_toggle),
-                        tint = if (uiState.isGeigerEnabled) ElectricCyan else ReadoutInkSecondary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Text(
-                        text = if (uiState.isGeigerEnabled) {
-                            String.format(Locale.US, "%.1fHz", uiState.geigerPulseRateHz)
-                        } else {
-                            "MUTE"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (uiState.isGeigerEnabled) ElectricCyan else ReadoutInkSecondary
-                    )
+                // Read-Only GPS Pill (Emerald <= 25m, Amber indoors/missing)
+                val gps = uiState.tileCacheState.anchorGps
+                val gpsGood = gps != null && gps.accuracyMeters <= 25.0f
+                val gpsLabel = if (gps != null) {
+                    String.format(Locale.US, "GPS %.0fm", gps.accuracyMeters)
+                } else {
+                    "GPS INDOOR"
                 }
-            }
-
-            // Field Guide '?' Button
-            IconButton(
-                onClick = onOpenFieldGuide,
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(ElevatedSurface)
-                    .border(1.dp, TacticalOutline, RoundedCornerShape(8.dp))
-                    .testTag("field_guide_button")
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.HelpOutline,
-                    contentDescription = stringResource(R.string.cd_field_guide),
-                    tint = ElectricCyan,
-                    modifier = Modifier.size(19.dp)
+                HudStatusPill(
+                    icon = Icons.Filled.GpsFixed,
+                    label = gpsLabel,
+                    tint = if (gpsGood) SignalEmerald else ThermalAmber,
+                    testTag = "hud_gps_pill",
+                    onClick = null
                 )
-            }
 
-            // Offline Session Log Button
-            IconButton(
-                onClick = onOpenSessionLog,
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(ElevatedSurface)
-                    .border(1.dp, TacticalOutline, RoundedCornerShape(8.dp))
-                    .testTag("session_log_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.History,
-                    contentDescription = stringResource(R.string.cd_session_log),
-                    tint = ReadoutInkPrimary,
-                    modifier = Modifier.size(19.dp)
+                // Read-Only MAG Health Pill
+                MagneticHealthPill(status = uiState.magneticStatus)
+
+                // Read-Only GNSS RF Environment Pill
+                GnssRfHealthPill(
+                    status = uiState.gnssRfStatus,
+                    onClick = onResetGnssBaseline
                 )
             }
         }
 
-        // Row 2: Horizontally Scrollable Tactical Status & Quick-Switch Pills
+        // Row 2: Single Horizontally Scrollable Action Chip Bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -479,23 +655,14 @@ private fun TopTacticalHud(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Bg Pins ON/OFF Declutter Toggle Chip (front of bar for instant 1-tap access)
-            val pinsOn = uiState.showBackgroundPins
-            HudStatusPill(
-                icon = if (pinsOn) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
-                label = if (pinsOn) "Bg Pins: ON" else "Bg Pins: OFF",
-                tint = if (pinsOn) ElectricCyan else ThermalAmber,
-                testTag = "hud_bg_pins_pill",
-                onClick = onToggleBackgroundPins
-            )
-
-            // Quick Carrying Mode Cycle Pill (Omni 0dB -> Pocket 16dB -> Corner 27dB) + Tilt Guard status
+            // 1. Body / Omni Mode
             val tiltGuardForcingZero = uiState.calibration.shieldDropDb > 0f &&
                 uiState.userPose.hasOrientationReading &&
                 uiState.userPose.isShieldTiltGuarded
-            val baseCarryingLabel = uiState.activePresets.shieldPreset?.shortLabel
+            val baseCarryingLabel = uiState.activePresets.shieldPreset
+                ?.contextualShortLabel(uiState.activePresets.screenOutwardMode)
                 ?: String.format(Locale.US, "Shield %.0fdB", uiState.calibration.shieldDropDb)
-            val carryingLabel = if (tiltGuardForcingZero) "$baseCarryingLabel (GUARD 0dB)" else baseCarryingLabel
+            val carryingLabel = if (tiltGuardForcingZero) "$baseCarryingLabel (0dB)" else baseCarryingLabel
             val carryingColor = when {
                 tiltGuardForcingZero -> ThermalAmber
                 uiState.activePresets.shieldPreset == ShieldPreset.OMNI_HANDHELD -> ReadoutInkPrimary
@@ -512,16 +679,7 @@ private fun TopTacticalHud(
                 onClick = onCycleCarryingMode
             )
 
-            // Magnetic Health Pill (MAG: 53µT vs MAG WARP)
-            MagneticHealthPill(status = uiState.magneticStatus)
-
-            // GNSS RF Environment Pill (NOMINAL / ELEVATED / JAMMING / SPOOFING)
-            GnssRfHealthPill(
-                status = uiState.gnssRfStatus,
-                onClick = onResetGnssBaseline
-            )
-
-            // Manual Screen Outward (+180 deg) Breast-Pocket Toggle Pill
+            // 2. Screen Outward (+180 deg)
             val outwardOn = uiState.activePresets.screenOutwardMode
             HudStatusPill(
                 icon = Icons.Filled.Explore,
@@ -531,7 +689,62 @@ private fun TopTacticalHud(
                 onClick = onToggleScreenOutward
             )
 
-            // TURBO / ECO Battery Toggle Pill
+            // 3. Follow Me ON/OFF
+            HudStatusPill(
+                icon = Icons.Filled.MyLocation,
+                label = if (uiState.followMeEnabled) "Follow Me: ON" else "Follow Me: OFF",
+                tint = if (uiState.followMeEnabled) SignalEmerald else ThermalAmber,
+                testTag = "hud_follow_me_pill",
+                onClick = onToggleFollowMe
+            )
+
+            // 4. Zoom Cycle Pill (25m / 50m / 100m)
+            HudStatusPill(
+                icon = Icons.Filled.ZoomIn,
+                label = "Zoom: ${uiState.radarZoomWidthMeters.roundToInt()}m",
+                tint = ElectricCyan,
+                testTag = "hud_zoom_pill",
+                onClick = onCycleZoom
+            )
+
+            // 5. Bg Pins ON/OFF
+            val pinsOn = uiState.showBackgroundPins
+            HudStatusPill(
+                icon = if (pinsOn) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
+                label = if (pinsOn) "Bg Pins: ON" else "Bg Pins: OFF",
+                tint = if (pinsOn) ElectricCyan else ThermalAmber,
+                testTag = "hud_bg_pins_pill",
+                onClick = onToggleBackgroundPins
+            )
+
+            // 6. Labels ON/OFF
+            HudStatusPill(
+                icon = Icons.Filled.Label,
+                label = if (uiState.showLabels) "Labels: ON" else "Labels: OFF",
+                tint = if (uiState.showLabels) ElectricCyan else ReadoutInkSecondary,
+                testTag = "hud_labels_pill",
+                onClick = onToggleLabels
+            )
+
+            // 7. Map ON/OFF
+            HudStatusPill(
+                icon = Icons.Filled.Layers,
+                label = if (uiState.mapOverlayEnabled) "Map: ON" else "Map: OFF",
+                tint = if (uiState.mapOverlayEnabled) ElectricCyan else ReadoutInkSecondary,
+                testTag = "hud_map_toggle_pill",
+                onClick = onToggleMapOverlay
+            )
+
+            // 8. Cache Area
+            HudStatusPill(
+                icon = Icons.Filled.CloudDownload,
+                label = if (uiState.tileCacheState.isDownloading) "Caching..." else "Cache Area",
+                tint = SignalEmerald,
+                testTag = "hud_cache_area_pill",
+                onClick = onCacheArea
+            )
+
+            // 9. TURBO / ECO
             val isTurbo = uiState.powerMode == PowerMode.TURBO
             HudStatusPill(
                 icon = if (isTurbo) Icons.Filled.Bolt else Icons.Filled.BatterySaver,
@@ -539,6 +752,32 @@ private fun TopTacticalHud(
                 tint = if (isTurbo) ThermalAmber else SignalEmerald,
                 testTag = "hud_power_mode_pill",
                 onClick = onTogglePowerMode
+            )
+
+            // 10. Geiger Mute / Hz
+            HudStatusPill(
+                icon = if (uiState.isGeigerEnabled) {
+                    Icons.AutoMirrored.Filled.VolumeUp
+                } else {
+                    Icons.AutoMirrored.Filled.VolumeOff
+                },
+                label = if (uiState.isGeigerEnabled) {
+                    String.format(Locale.US, "Geiger %.1fHz", uiState.geigerPulseRateHz)
+                } else {
+                    "Geiger Mute"
+                },
+                tint = if (uiState.isGeigerEnabled) ElectricCyan else ReadoutInkSecondary,
+                testTag = "geiger_toggle_button",
+                onClick = onToggleGeiger
+            )
+
+            // 11. ? Guide
+            HudStatusPill(
+                icon = Icons.AutoMirrored.Filled.HelpOutline,
+                label = "? Guide",
+                tint = ElectricCyan,
+                testTag = "field_guide_button",
+                onClick = onOpenFieldGuide
             )
         }
     }
@@ -550,6 +789,25 @@ private fun MiniCompassRose(
     modifier: Modifier = Modifier
 ) {
     val headingRad = userPose.headingRad
+    val cardinalPaint = remember {
+        android.graphics.Paint().apply {
+            isAntiAlias = true
+            color = android.graphics.Color.rgb(148, 163, 184)
+            textSize = 16f
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+    }
+    val northPaint = remember {
+        android.graphics.Paint().apply {
+            isAntiAlias = true
+            color = android.graphics.Color.rgb(0, 229, 255)
+            textSize = 17f
+            textAlign = android.graphics.Paint.Align.CENTER
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+    }
+
     Canvas(
         modifier = modifier
             .clip(CircleShape)
@@ -559,17 +817,27 @@ private fun MiniCompassRose(
         val cx = size.width / 2f
         val cy = size.height / 2f
         val r = size.minDimension * 0.42f
-        // Outer ring & cardinal ticks
+        // Outer ring & crisp N/E/S/W cardinal ticks
         drawCircle(TacticalOutline, radius = r, center = Offset(cx, cy), style = Stroke(1.2f))
-        drawLine(ElectricCyan.copy(alpha = 0.6f), Offset(cx, cy - r), Offset(cx, cy - r + 4f), 1.8f)
+        drawLine(ElectricCyan.copy(alpha = 0.8f), Offset(cx, cy - r), Offset(cx, cy - r + 4f), 2.0f)
+        drawLine(TacticalOutline, Offset(cx + r, cy), Offset(cx + r - 4f, cy), 1.4f)
+        drawLine(TacticalOutline, Offset(cx, cy + r), Offset(cx, cy + r - 4f), 1.4f)
+        drawLine(TacticalOutline, Offset(cx - r, cy), Offset(cx - r + 4f, cy), 1.4f)
+
+        val nc = drawContext.canvas.nativeCanvas
+        nc.drawText("N", cx, cy - r + 13f, northPaint)
+        nc.drawText("E", cx + r - 7f, cy + 5f, cardinalPaint)
+        nc.drawText("S", cx, cy + r - 3f, cardinalPaint)
+        nc.drawText("W", cx - r + 7f, cy + 5f, cardinalPaint)
+
         // Rotating heading needle
         val tip = Offset(
-            x = cx + (r * 0.85f * cos(headingRad)).toFloat(),
-            y = cy - (r * 0.85f * sin(headingRad)).toFloat()
+            x = cx + (r * 0.72f * cos(headingRad)).toFloat(),
+            y = cy - (r * 0.72f * sin(headingRad)).toFloat()
         )
         val tail = Offset(
-            x = cx - (r * 0.45f * cos(headingRad)).toFloat(),
-            y = cy + (r * 0.45f * sin(headingRad)).toFloat()
+            x = cx - (r * 0.40f * cos(headingRad)).toFloat(),
+            y = cy + (r * 0.40f * sin(headingRad)).toFloat()
         )
         drawLine(ThermalAmber, Offset(cx, cy), tail, 2.2f, StrokeCap.Round)
         drawLine(ElectricCyan, Offset(cx, cy), tip, 2.8f, StrokeCap.Round)
@@ -581,16 +849,21 @@ private fun MiniCompassRose(
 private fun MagneticHealthPill(status: MagneticFieldStatus) {
     val color = when {
         !status.hasSensorReading -> ReadoutInkMuted
-        status.isMagneticWarped -> ThermalAmber
+        status.needsFigure8Calibration || status.isMagneticWarped -> ThermalAmber
         else -> SignalEmerald
     }
     val text = when {
         !status.hasSensorReading -> "MAG: --"
-        status.isMagneticWarped -> String.format(Locale.US, "MAG WARP %.0fµT", status.fluxMicroTesla)
-        else -> String.format(Locale.US, "MAG: %.0fµT", status.fluxMicroTesla)
+        status.needsFigure8Calibration -> "WAVE FIGURE-8"
+        status.isMagneticWarped && status.baselineFluxMicroTesla != null ->
+            String.format(Locale.US, "MAG DRIFT (+%.0fµT)", status.driftDeltaMicroTesla)
+        status.isMagneticWarped ->
+            String.format(Locale.US, "MAG DRIFT %.0fµT", status.fluxMicroTesla)
+        else ->
+            String.format(Locale.US, "MAG: %.0fµT", status.fluxMicroTesla)
     }
     HudStatusPill(
-        icon = if (status.isMagneticWarped) Icons.Filled.Warning else Icons.Filled.Explore,
+        icon = if (status.isMagneticWarped || status.needsFigure8Calibration) Icons.Filled.Warning else Icons.Filled.Explore,
         label = text,
         tint = color,
         testTag = "hud_mag_health_pill",
@@ -1051,16 +1324,17 @@ private fun TacticalActionRow(
     hasLockedTarget: Boolean,
     isHeadingZeroed: Boolean,
     onZeroHeading: () -> Unit,
-    onResetGrid: () -> Unit,
+    onResetHeatmap: () -> Unit,
+    onPurgeScans: () -> Unit,
     onSaveSnapshot: () -> Unit
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         OutlinedButton(
             onClick = onZeroHeading,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
             shape = RoundedCornerShape(10.dp),
             border = BorderStroke(
                 1.dp,
@@ -1075,12 +1349,6 @@ private fun TacticalActionRow(
                 .minimumInteractiveComponentSize()
                 .testTag("zero_heading_button")
         ) {
-            Icon(
-                imageVector = Icons.Filled.Explore,
-                contentDescription = stringResource(R.string.cd_zero_heading),
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(modifier = Modifier.width(4.dp))
             Text(
                 text = if (isHeadingZeroed) "CLR HDG" else "ZERO HDG",
                 style = MaterialTheme.typography.labelSmall,
@@ -1089,8 +1357,8 @@ private fun TacticalActionRow(
         }
 
         OutlinedButton(
-            onClick = onResetGrid,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+            onClick = onResetHeatmap,
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
             shape = RoundedCornerShape(10.dp),
             border = BorderStroke(1.dp, TacticalOutline),
             colors = ButtonDefaults.outlinedButtonColors(
@@ -1098,18 +1366,33 @@ private fun TacticalActionRow(
                 contentColor = ReadoutInkPrimary
             ),
             modifier = Modifier
-                .weight(1f)
+                .weight(1.1f)
                 .minimumInteractiveComponentSize()
-                .testTag("reset_grid_button")
+                .testTag("reset_heatmap_button")
         ) {
-            Icon(
-                imageVector = Icons.Filled.Refresh,
-                contentDescription = stringResource(R.string.cd_reset_grid),
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(modifier = Modifier.width(4.dp))
             Text(
-                text = "RST GRID",
+                text = "RST HEATMAP",
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1
+            )
+        }
+
+        OutlinedButton(
+            onClick = onPurgeScans,
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, ThermalAmber.copy(alpha = 0.6f)),
+            colors = ButtonDefaults.outlinedButtonColors(
+                containerColor = CharcoalSurface,
+                contentColor = ThermalAmber
+            ),
+            modifier = Modifier
+                .weight(1.1f)
+                .minimumInteractiveComponentSize()
+                .testTag("purge_scans_button")
+        ) {
+            Text(
+                text = "PURGE SCANS",
                 style = MaterialTheme.typography.labelSmall,
                 maxLines = 1
             )
@@ -1118,7 +1401,7 @@ private fun TacticalActionRow(
         Button(
             onClick = onSaveSnapshot,
             enabled = hasLockedTarget,
-            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
             shape = RoundedCornerShape(10.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = SignalEmerald,
@@ -1131,12 +1414,6 @@ private fun TacticalActionRow(
                 .minimumInteractiveComponentSize()
                 .testTag("save_snapshot_button")
         ) {
-            Icon(
-                imageVector = Icons.Filled.BookmarkAdd,
-                contentDescription = stringResource(R.string.cd_save_snapshot),
-                modifier = Modifier.size(16.dp)
-            )
-            Spacer(modifier = Modifier.width(4.dp))
             Text(
                 text = "SAVE & PIN",
                 style = MaterialTheme.typography.labelSmall,
