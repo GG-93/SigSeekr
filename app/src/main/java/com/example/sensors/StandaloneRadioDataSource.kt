@@ -110,17 +110,8 @@ class StandaloneRadioDataSource(
     override fun measurementsFlow(): Flow<RfMeasurement> = callbackFlow {
         val scope = CoroutineScope(coroutineContext + Dispatchers.Default)
 
-        // 1. Continuous low-latency BLE advertisement scanner
-        val bleScanner = try {
-            val adapter = bluetoothManager?.adapter
-            if (adapter != null && adapter.isEnabled && hasBleScanPermission()) {
-                adapter.bluetoothLeScanner
-            } else {
-                null
-            }
-        } catch (_: SecurityException) {
-            null
-        }
+        // 1. Continuous low-latency BLE advertisement scanner (with lazy retry if BT toggled on later)
+        var activeBleScanner: android.bluetooth.le.BluetoothLeScanner? = null
 
         val bleCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: BleScanResult) {
@@ -167,22 +158,37 @@ class StandaloneRadioDataSource(
             }
         }
 
-        if (bleScanner != null) {
-            try {
-                val settings = ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                    .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-                    .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-                    .setReportDelay(0L)
-                    .build()
-                bleScanner.startScan(null, settings, bleCallback)
-            } catch (_: SecurityException) {
-                // Gracefully degrade if user revokes BLE permission mid-session
-            } catch (_: IllegalStateException) {
-                // Bluetooth radio toggled off
+        val ensureBleScanStarted: () -> Unit = {
+            if (activeBleScanner == null && hasBleScanPermission()) {
+                val scanner = try {
+                    val adapter = bluetoothManager?.adapter
+                    if (adapter != null && adapter.isEnabled) adapter.bluetoothLeScanner else null
+                } catch (_: SecurityException) {
+                    null
+                }
+                if (scanner != null) {
+                    try {
+                        val settings = ScanSettings.Builder()
+                            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                            .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                            .setReportDelay(0L)
+                            .build()
+                        scanner.startScan(null, settings, bleCallback)
+                        activeBleScanner = scanner
+                    } catch (_: SecurityException) {
+                        // Gracefully degrade if user revokes BLE permission mid-session
+                    } catch (_: IllegalStateException) {
+                        // Bluetooth radio toggled off
+                    }
+                }
+            } else if (activeBleScanner != null && bluetoothManager?.adapter?.isEnabled != true) {
+                activeBleScanner = null
             }
         }
+
+        ensureBleScanStarted()
 
         // 2. Wi-Fi ScanResult BroadcastReceiver + periodic trigger
         val emitLatestWifiResults: () -> Unit = {
@@ -244,6 +250,7 @@ class StandaloneRadioDataSource(
         val wifiPollJob = scope.launch {
             while (isActive) {
                 delay(3_500L)
+                ensureBleScanStarted()
                 triggerWifiScan()
                 emitLatestWifiResults()
             }
@@ -258,9 +265,11 @@ class StandaloneRadioDataSource(
                     // Already unregistered
                 }
             }
-            if (bleScanner != null && hasBleScanPermission()) {
+            val scannerToStop = activeBleScanner
+            activeBleScanner = null
+            if (scannerToStop != null && hasBleScanPermission()) {
                 try {
-                    bleScanner.stopScan(bleCallback)
+                    scannerToStop.stopScan(bleCallback)
                 } catch (_: Exception) {
                     // Bluetooth radio may have turned off
                 }
@@ -418,5 +427,9 @@ class StandaloneRadioDataSource(
             return fineLoc && nearbyWifi
         }
         return fineLoc
+    }
+
+    fun shutdown() {
+        rttExecutor.shutdownNow()
     }
 }

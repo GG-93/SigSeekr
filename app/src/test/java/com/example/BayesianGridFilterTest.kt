@@ -3,14 +3,18 @@ package com.example
 import com.example.dsp.AngleMath
 import com.example.dsp.BayesianGridFilter
 import com.example.dsp.CalibrationParams
+import com.example.dsp.HampelRssiFilter
 import com.example.dsp.LocalizationTier
 import com.example.sensors.GeigerFeedbackEngine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.sin
 
 class BayesianGridFilterTest {
 
@@ -127,5 +131,113 @@ class BayesianGridFilterTest {
         assertEquals(12.0f, GeigerFeedbackEngine.distanceToFrequencyHz(0.2f), 1e-4f)
         val mid = GeigerFeedbackEngine.distanceToFrequencyHz(5.0f)
         assertTrue("Expected smooth intermediate frequency in (1, 12), was $mid", mid in 1.1f..11.9f)
+    }
+
+    @Test
+    fun laplaceSmoothing2Percent_maintainsUniformFloorAndUnitMass() {
+        val filter = BayesianGridFilter()
+        val params = CalibrationParams(shieldDropDb = 22.0f, txPowerP0Dbm = -45.0f, pathLossExponentN = 2.5f)
+        for (i in 0 until 8) {
+            filter.updateWithShieldedRssi(
+                userX = 25.0,
+                userY = 25.0,
+                userHeadingRad = PI / 2.0,
+                measuredRssiDbm = -52.0,
+                params = params
+            )
+        }
+        assertEquals(1.0, filter.totalProbabilityMass(), 1e-6)
+        val expectedFloor = BayesianGridFilter.LAPLACE_SMOOTHING_ALPHA * BayesianGridFilter.UNIFORM_PROB
+        // Far corner cell (0, 0) must stay >= 2% Laplace uniform floor
+        val cornerProb = filter.probabilityAt(0, 0)
+        assertTrue(
+            "Expected corner prob ($cornerProb) >= Laplace floor ($expectedFloor)",
+            cornerProb >= expectedFloor - 1e-12
+        )
+    }
+
+    @Test
+    fun tiltGuardActive_forcesZeroShieldLossSymmetry() {
+        val filter = BayesianGridFilter()
+        val params = CalibrationParams(shieldDropDb = 27.0f, txPowerP0Dbm = -45.0f, pathLossExponentN = 2.5f)
+        filter.updateWithShieldedRssi(
+            userX = 25.0,
+            userY = 25.0,
+            userHeadingRad = PI / 2.0,
+            measuredRssiDbm = -64.45,
+            params = params,
+            tiltGuardActive = true
+        )
+        // With shieldLoss forced to 0 dB, North (25m, 31m -> idx 50, 62) and South (25m, 19m -> idx 50, 38)
+        // are equidistant from (25.25, 25.25) approx -> check exact symmetric pair around (25.0, 25.0):
+        // xIdx=50 -> x=25.25, yIdx=62 -> y=31.25 (dy=+6.25), yIdx=37 -> y=18.75 (dy=-6.25)
+        val probNorth = filter.probabilityAt(50, 62)
+        val probSouth = filter.probabilityAt(50, 37)
+        assertEquals(probNorth, probSouth, 1e-9)
+    }
+
+    @Test
+    fun hampelRssiFilter_rejectsMultipathSpikeAndStaysNegative() {
+        val hampel = HampelRssiFilter()
+        assertEquals(-62.0, hampel.update(-62.0), 1e-6)
+        assertEquals(-61.0, hampel.update(-61.0), 1e-6)
+        assertEquals(-63.0, hampel.update(-63.0), 1e-6)
+        assertEquals(-62.0, hampel.update(-62.0), 1e-6)
+        // Sudden +37 dB multipath spike (-25 dBm) must be replaced by window median (-62 dBm)
+        val filteredSpike = hampel.update(-25.0)
+        assertEquals(-62.0, filteredSpike, 1e-6)
+        // Strictly negative even on invalid positive input
+        assertTrue(hampel.update(20.0) <= -1.0)
+    }
+
+    @Test
+    fun orientationExtraction_eliminatesVerticalGimbalLockAndAppliesTiltGuardAndScreenOutward() {
+        // 1. Flat phone facing North (identity matrix): pitch = 0 deg, roll = 0 deg -> tilt guard ON
+        val flatNorth = floatArrayOf(
+            1f, 0f, 0f,
+            0f, 1f, 0f,
+            0f, 0f, 1f
+        )
+        val resFlat = AngleMath.extractOrientationFromRotationMatrix(flatNorth, screenOutwardMode = false)
+        assertEquals(0.0, resFlat.azimuthRad, 1e-4)
+        assertEquals(0.0, resFlat.pitchDeg, 1e-4)
+        assertEquals(0.0, resFlat.rollDeg, 1e-4)
+        assertTrue(resFlat.isTiltGuardTriggered)
+
+        // 2. Upright 90 deg portrait facing North (rear camera -Z -> North, +Y -> Up, +X -> East):
+        //    Col0 (+X) = (1,0,0), Col1 (+Y) = (0,0,1), Col2 (+Z) = (0,-1,0)
+        val uprightNorth = floatArrayOf(
+            1f, 0f, 0f,
+            0f, 0f, -1f,
+            0f, 1f, 0f
+        )
+        val resUpright = AngleMath.extractOrientationFromRotationMatrix(uprightNorth, screenOutwardMode = false)
+        assertEquals(0.0, resUpright.azimuthRad, 1e-4)
+        assertEquals(-90.0, resUpright.pitchDeg, 1e-4)
+        assertEquals(0.0, resUpright.rollDeg, 1e-4)
+        assertFalse(resUpright.isTiltGuardTriggered)
+
+        // 3. Same upright matrix with manual Screen Outward (+180 deg) toggle -> flips azimuth by pi
+        val resOutward = AngleMath.extractOrientationFromRotationMatrix(uprightNorth, screenOutwardMode = true)
+        assertEquals(PI, abs(resOutward.azimuthRad), 1e-4)
+
+        // 4. Upright phone rolled 50 deg sideways -> tilt guard ON (|roll| > 45 deg)
+        val rollRad = Math.toRadians(50.0)
+        val c = cos(rollRad).toFloat()
+        val s = sin(rollRad).toFloat()
+        val uprightRolled50 = floatArrayOf(
+            c, -s, 0f,
+            0f, 0f, -1f,
+            s, c, 0f
+        )
+        val resRolled = AngleMath.extractOrientationFromRotationMatrix(uprightRolled50, screenOutwardMode = false)
+        assertEquals(50.0, resRolled.rollDeg, 1e-2)
+        assertTrue(resRolled.isTiltGuardTriggered)
+
+        // Boundary checks for |roll| > 45 or |pitch| < 15
+        assertTrue(AngleMath.isShieldTiltGuarded(pitchDeg = -14.9, rollDeg = 0.0))
+        assertFalse(AngleMath.isShieldTiltGuarded(pitchDeg = -15.0, rollDeg = 0.0))
+        assertFalse(AngleMath.isShieldTiltGuarded(pitchDeg = -60.0, rollDeg = 45.0))
+        assertTrue(AngleMath.isShieldTiltGuarded(pitchDeg = -60.0, rollDeg = 45.1))
     }
 }

@@ -27,8 +27,6 @@ class MainActivity : ComponentActivity() {
         RadarViewModel.Factory(application)
     }
 
-    private var pendingExportFormat: ExportFormat = ExportFormat.JSON
-
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
@@ -112,7 +110,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchDocumentExporter(format: ExportFormat) {
-        pendingExportFormat = format
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val filename = "sigseeker_log_$stamp.${format.fileExtension}"
         when (format) {

@@ -59,6 +59,14 @@ object PermissionHelper {
         return true
     }
 
+    fun hasActivityRecognitionPermission(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACTIVITY_RECOGNITION
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
     fun friendlyName(permission: String): String = when (permission) {
         Manifest.permission.ACCESS_FINE_LOCATION -> "Fine Location (RF Positioning)"
         Manifest.permission.ACCESS_COARSE_LOCATION -> "Coarse Location"

@@ -66,6 +66,16 @@ data class UserPose(
     val rawAzimuthRad: Double = 0.0,
     /** User-calibrated compass offset psi_offset (radians) set by Zero Heading. */
     val headingOffsetRad: Double = 0.0,
+    /** Device pitch in degrees (0 deg flat, -90 deg upright portrait). */
+    val pitchDeg: Double = -45.0,
+    /** Device sideways roll in degrees (0 deg level, +/-90 deg landscape). */
+    val rollDeg: Double = 0.0,
+    /** True when |roll| > 45 deg or |pitch| < 15 deg, forcing shieldLoss = 0 dB. */
+    val isShieldTiltGuarded: Boolean = false,
+    /** True when user enables Screen Outward (+180 deg) breast-pocket orientation flip. */
+    val screenOutwardMode: Boolean = false,
+    /** True once at least one live IMU orientation event has been received. */
+    val hasOrientationReading: Boolean = false,
     val stepCount: Int = 0,
     val trail: List<Point2D> = listOf(Point2D(25.0, 25.0))
 ) {
@@ -135,7 +145,7 @@ data class DiscoveredEmitter(
     val lastSeenElapsedMs: Long,
     val scanResult: ScanResult? = null,
     val fingerprintHash: String = macAddress,
-    val kalmanRssiDbm: Float = rssiDbm.toFloat().coerceAtMost(-1.0f),
+    val kalmanRssiDbm: Float = rssiDbm.toFloat().coerceIn(-127.0f, -1.0f),
     val bleDecoded: BleDecodedPacket? = null,
     val observedMacCount: Int = 1
 ) {

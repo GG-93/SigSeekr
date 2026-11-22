@@ -75,15 +75,19 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
 
     private val lock = Any()
     private val rotationMatrix = FloatArray(9)
-    private val orientationAngles = FloatArray(3)
+    private val lastRotationMatrix = FloatArray(9)
     private val lastAccel = FloatArray(3)
     private val lastMagnet = FloatArray(3)
+    private var hasRotationMatrix = false
     private var hasAccel = false
     private var hasMagnet = false
     private var smoothedFluxUt: Float? = null
 
     @Volatile
     private var stepLengthMeters: Double = 0.72
+
+    @Volatile
+    private var screenOutwardMode: Boolean = false
 
     private var isStarted = false
 
@@ -146,6 +150,30 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
 
     fun updateStepLength(meters: Float) {
         stepLengthMeters = meters.toDouble().coerceIn(0.50, 1.00)
+    }
+
+    /**
+     * Toggles manual +180 deg heading flip for placing the phone screen-outward
+     * inside a breast pocket. Default (false) aligns upright forward heading with
+     * rear camera (-Z, screen facing user).
+     */
+    fun setScreenOutwardMode(enabled: Boolean) {
+        synchronized(lock) {
+            if (screenOutwardMode == enabled) return
+            screenOutwardMode = enabled
+            if (hasRotationMatrix) {
+                updateOrientationFromMatrixLocked(lastRotationMatrix)
+            } else {
+                val current = _pose.value
+                val flippedAzimuth = AngleMath.wrapAngle(current.rawAzimuthRad + PI)
+                val newTheta = AngleMath.azimuthToCartesianHeading(flippedAzimuth, current.headingOffsetRad)
+                _pose.value = current.copy(
+                    rawAzimuthRad = flippedAzimuth,
+                    headingRad = newTheta,
+                    screenOutwardMode = enabled
+                )
+            }
+        }
     }
 
     /** Captures current raw azimuth as compass offset so physical facing aligns to Grid North (0 deg). */
@@ -219,8 +247,9 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
             Sensor.TYPE_ROTATION_VECTOR,
             Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> {
                 SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-                SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                updateOrientation(orientationAngles[0].toDouble())
+                synchronized(lock) {
+                    updateOrientationFromMatrixLocked(rotationMatrix)
+                }
             }
 
             Sensor.TYPE_ACCELEROMETER -> {
@@ -229,8 +258,9 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                 if (rotationVectorSensor == null && hasMagnet &&
                     SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMagnet)
                 ) {
-                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                    updateOrientation(orientationAngles[0].toDouble())
+                    synchronized(lock) {
+                        updateOrientationFromMatrixLocked(rotationMatrix)
+                    }
                 }
             }
 
@@ -258,8 +288,9 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                 if (rotationVectorSensor == null && hasAccel &&
                     SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMagnet)
                 ) {
-                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
-                    updateOrientation(orientationAngles[0].toDouble())
+                    synchronized(lock) {
+                        updateOrientationFromMatrixLocked(rotationMatrix)
+                    }
                 }
             }
 
@@ -269,19 +300,28 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         }
     }
 
-    private fun updateOrientation(rawAzimuthPsiRad: Double) {
-        if (!rawAzimuthPsiRad.isFinite()) return
-        synchronized(lock) {
-            val current = _pose.value
-            val theta = AngleMath.azimuthToCartesianHeading(
-                azimuthPsiRad = rawAzimuthPsiRad,
-                headingOffsetRad = current.headingOffsetRad
-            )
-            _pose.value = current.copy(
-                rawAzimuthRad = rawAzimuthPsiRad,
-                headingRad = theta
-            )
-        }
+    private fun updateOrientationFromMatrixLocked(matrix: FloatArray) {
+        System.arraycopy(matrix, 0, lastRotationMatrix, 0, 9)
+        hasRotationMatrix = true
+        val orient = AngleMath.extractOrientationFromRotationMatrix(
+            rotationMatrix = matrix,
+            screenOutwardMode = screenOutwardMode
+        )
+        if (!orient.azimuthRad.isFinite()) return
+        val current = _pose.value
+        val theta = AngleMath.azimuthToCartesianHeading(
+            azimuthPsiRad = orient.azimuthRad,
+            headingOffsetRad = current.headingOffsetRad
+        )
+        _pose.value = current.copy(
+            rawAzimuthRad = orient.azimuthRad,
+            headingRad = theta,
+            pitchDeg = orient.pitchDeg,
+            rollDeg = orient.rollDeg,
+            isShieldTiltGuarded = orient.isTiltGuardTriggered,
+            screenOutwardMode = screenOutwardMode,
+            hasOrientationReading = true
+        )
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {

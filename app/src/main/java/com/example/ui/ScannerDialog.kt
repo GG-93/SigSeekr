@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -67,6 +68,7 @@ import com.example.dsp.DiscoveredEmitter
 import com.example.dsp.EmitterTransport
 import com.example.sensors.CellRadioGeneration
 import com.example.sensors.CellTowerInfo
+import com.example.sensors.CellularMonitor
 import com.example.sensors.CellularSnapshot
 import com.example.ui.theme.CharcoalSurface
 import com.example.ui.theme.ElectricCyan
@@ -116,6 +118,7 @@ fun ScannerDialog(
     onDismiss: () -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(ScannerFilterTab.ALL) }
+    var selectedCellTower by remember { mutableStateOf<CellTowerInfo?>(null) }
     var manualFrozen by remember { mutableStateOf(false) }
     var touchFrozen by remember { mutableStateOf(false) }
     var lastInteractionToken by remember { mutableLongStateOf(0L) }
@@ -324,6 +327,7 @@ fun ScannerDialog(
                 if (selectedTab == ScannerFilterTab.CELL_TOWERS) {
                     CellularTowersPanel(
                         snapshot = cellularSnapshot,
+                        onSelectTower = { tower -> selectedCellTower = tower },
                         onRequestPhoneStatePermission = onRequestPhoneStatePermission,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -394,6 +398,16 @@ fun ScannerDialog(
                 }
             }
         }
+    }
+
+    // Dedicated Plain-English Cellular Tower Dossier Sheet
+    val inspectedTower = selectedCellTower
+    if (inspectedTower != null) {
+        CellTowerDossierSheet(
+            tower = inspectedTower,
+            cellularSnapshot = cellularSnapshot,
+            onDismiss = { selectedCellTower = null }
+        )
     }
 }
 
@@ -555,6 +569,7 @@ private fun MiniScannerBadge(text: String, color: Color) {
 @Composable
 private fun CellularTowersPanel(
     snapshot: CellularSnapshot,
+    onSelectTower: (CellTowerInfo) -> Unit,
     onRequestPhoneStatePermission: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -702,11 +717,15 @@ private fun CellularTowersPanel(
                     .testTag("cellular_tower_list"),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(
+                itemsIndexed(
                     items = snapshot.towers,
-                    key = { "${it.generation.name}_${it.isServing}_${it.pci}_${it.arfcn}" }
-                ) { tower ->
-                    CellTowerCard(tower = tower)
+                    key = { idx, it -> "${idx}_${it.generation.name}_${it.isServing}_${it.pci}_${it.arfcn}" }
+                ) { idx, tower ->
+                    CellTowerCard(
+                        tower = tower,
+                        onClick = { onSelectTower(tower) },
+                        testTag = "cell_tower_row_$idx"
+                    )
                 }
             }
         }
@@ -714,13 +733,21 @@ private fun CellularTowersPanel(
 }
 
 @Composable
-private fun CellTowerCard(tower: CellTowerInfo) {
+private fun CellTowerCard(
+    tower: CellTowerInfo,
+    onClick: () -> Unit,
+    testTag: String
+) {
     val genColor = when (tower.generation) {
         CellRadioGeneration.NR_5G -> ElectricCyan
         CellRadioGeneration.LTE_4G -> SignalEmerald
         CellRadioGeneration.WCDMA_3G -> ThermalAmber
         CellRadioGeneration.GSM_2G -> TacticalCrimson
     }
+    val carrierLabel = CellularMonitor.lookupCarrierName(tower.plmn)
+        ?: "PLMN ${tower.plmn ?: "--"}"
+    val bandLabel = CellularMonitor.deriveBandLabel(tower.generation, tower.arfcn, tower.bands)
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -731,7 +758,9 @@ private fun CellTowerCard(tower: CellTowerInfo) {
                 if (tower.isServing) genColor.copy(alpha = 0.75f) else TacticalOutline,
                 RoundedCornerShape(10.dp)
             )
-            .padding(10.dp),
+            .clickable(onClick = onClick)
+            .padding(10.dp)
+            .testTag(testTag),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
         Row(
@@ -747,9 +776,11 @@ private fun CellTowerCard(tower: CellTowerInfo) {
             }
             Spacer(modifier = Modifier.weight(1f))
             Text(
-                text = "PLMN ${tower.plmn ?: "--"}",
+                text = carrierLabel,
                 style = MaterialTheme.typography.labelSmall,
-                color = ReadoutInkMuted
+                color = ReadoutInkSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
 
@@ -777,11 +808,24 @@ private fun CellTowerCard(tower: CellTowerInfo) {
             )
         }
 
-        if (tower.arfcn != null || tower.timingAdvance != null) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Text(
-                text = "ARFCN: ${tower.arfcn ?: "--"} · Timing Advance Index: ${tower.timingAdvance ?: "--"}",
+                text = "Band: $bandLabel · ARFCN ${tower.arfcn ?: "--"}",
                 style = MaterialTheme.typography.labelSmall,
-                color = ReadoutInkSecondary
+                color = ReadoutInkSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = "DOSSIER ▸",
+                style = MaterialTheme.typography.labelSmall,
+                color = ElectricCyan
             )
         }
     }

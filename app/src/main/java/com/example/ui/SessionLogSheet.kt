@@ -234,7 +234,7 @@ fun SessionLogDialog(
                                 color = ReadoutInkPrimary
                             )
                             Text(
-                                text = "Lock a target on the radar and tap SAVE SNAP to record timestamped coordinates, min distance, and peak RSSI offline.",
+                                text = "Lock a target on the radar and tap SAVE & PIN to record timestamped coordinates, min distance, and peak RSSI offline.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = ReadoutInkSecondary
                             )

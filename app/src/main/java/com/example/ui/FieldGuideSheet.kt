@@ -188,7 +188,7 @@ private fun CarryingGuideContent() {
     GuideSectionCard(
         title = "2. BREAST POCKET / BODY SHIELD (16 dB)",
         accent = SignalEmerald,
-        body = "Place the phone vertically against your chest or breast pocket with the screen facing OUTWARD away from your torso. Water in the human body absorbs 2.4/5 GHz RF behind you by ~16 dB, turning your body into a passive directional shield."
+        body = "Hold the phone upright against your chest (screen facing you aligns forward to rear camera −Z by default), or place it screen-outward inside a breast pocket and enable the Screen Outward (+180°) toggle. Water in the human body absorbs 2.4/5 GHz RF behind you by ~16 dB. Tilt/Pocket Guard automatically forces 0 dB shielding if |roll| > 45° or |pitch| < 15°."
     )
     GuideSectionCard(
         title = "3. FLAT ALUMINUM PLATE (22 dB)",
@@ -227,7 +227,7 @@ private fun TriangulationGuideContent() {
     GuideSectionCard(
         title = "STEP 4 · TRIANGULATION LOCKED (CEP95 ≤ 1.5m)",
         accent = SignalEmerald,
-        body = "When 95% of the posterior probability mass fits inside a 1.5m radius (CEP95 ≤ 1.5m), the triangulation triangle illuminates solid emerald/gold. Tap SAVE SNAP to store the coordinates in SQLite and permanently PIN the target on the map."
+        body = "When 95% of the posterior probability mass fits inside a 1.5m radius (CEP95 ≤ 1.5m), the triangulation triangle illuminates solid emerald/gold. Tap SAVE & PIN to store the coordinates in SQLite and permanently PIN the target on the map."
     )
 }
 

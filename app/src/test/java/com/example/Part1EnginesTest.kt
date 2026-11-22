@@ -138,7 +138,7 @@ class Part1EnginesTest {
 
         // Verify tracker groups randomized MACs under single fingerprintHash
         val tracker = BackgroundEmitterTracker()
-        val cal = CalibrationParams()
+        val cal = CalibrationParams(shieldDropDb = 16.0f)
         tracker.ingest(
             RfMeasurement(
                 macAddress = "4E:00:00:00:00:01",
@@ -163,17 +163,114 @@ class Part1EnginesTest {
             UserPose(xMeters = 25.0, yMeters = 25.0, headingRad = Math.toRadians(12.0)),
             cal
         )
-        val bg = tracker.snapshot(2000L, UserPose(), cal)
-        assertEquals(1, bg.size)
-        assertEquals(2, bg[0].observedMacCount)
-        assertEquals(EmitterShapeStage.HEXAGON, bg[0].shapeStage)
+        // Only 12 deg heading span and 1 dB contrast -> MUST stay SEMICIRCLE (no false Hexagon!)
+        val bgNarrow = tracker.snapshot(2000L, UserPose(), cal)
+        assertEquals(1, bgNarrow.size)
+        assertEquals(2, bgNarrow[0].observedMacCount)
+        assertEquals(EmitterShapeStage.SEMICIRCLE, bgNarrow[0].shapeStage)
         assertEquals(2, tracker.observedMacHistoryFor("BLE_FP:AABBCCDDEEFF").size)
+
+        // Sweep across >= 180 deg with >= 4 dB shielded rear null contrast -> promotes to HEXAGON
+        val sweepSamples = listOf(
+            90.0 to -70,
+            180.0 to -78,
+            270.0 to -71
+        )
+        var ts = 2100L
+        for ((deg, rssi) in sweepSamples) {
+            tracker.ingest(
+                RfMeasurement(
+                    macAddress = "6A:00:00:00:00:02",
+                    displayName = "AirTag",
+                    transport = EmitterTransport.BLE,
+                    rssiDbm = rssi,
+                    timestampElapsedMs = ts,
+                    fingerprintHash = "BLE_FP:AABBCCDDEEFF"
+                ),
+                UserPose(xMeters = 25.0, yMeters = 25.0, headingRad = Math.toRadians(deg)),
+                cal
+            )
+            ts += 200L
+        }
+        val bgSwept = tracker.snapshot(ts, UserPose(), cal)
+        assertEquals(EmitterShapeStage.HEXAGON, bgSwept[0].shapeStage)
 
         // Immediate fingerprintHash pinning transitions stage directly to PINNED
         tracker.pinTarget("BLE_FP:AABBCCDDEEFF", "6A:00:00:00:00:02")
-        val pinnedBg = tracker.snapshot(2100L, UserPose(), cal)
+        val pinnedBg = tracker.snapshot(ts + 100L, UserPose(), cal)
         assertEquals(EmitterShapeStage.PINNED, pinnedBg[0].shapeStage)
         assertTrue(pinnedBg[0].isSavedInLog)
+
+        // Clearing SQLite log unpins fingerprintHash as well as MACs
+        tracker.updateSavedLogMacs(emptySet())
+        val unpinnedBg = tracker.snapshot(ts + 200L, UserPose(), cal)
+        assertFalse(unpinnedBg[0].isSavedInLog)
+        assertEquals(EmitterShapeStage.HEXAGON, unpinnedBg[0].shapeStage)
+    }
+
+    @Test
+    fun backgroundEmitterTracker_stationaryOmniPacketsDoNotStackOrPromoteToHexagon() {
+        val tracker = BackgroundEmitterTracker()
+        val omniCal = CalibrationParams(shieldDropDb = 0.0f)
+        // Stationary phone facing 320 deg NW (azimuth -40 deg -> Cartesian theta = 130 deg)
+        val stationaryHeadingRad = Math.toRadians(130.0)
+        val stationaryPose = UserPose(
+            xMeters = 25.0,
+            yMeters = 25.0,
+            headingRad = stationaryHeadingRad,
+            stepCount = 0
+        )
+
+        // Feed 25 distinct emitters x 10 packets each at the exact same stationary heading
+        var ts = 1_000L
+        for (i in 0 until 25) {
+            val bssid = String.format(java.util.Locale.US, "AA:BB:CC:DD:EE:%02X", i)
+            val fp = DeviceFingerprintEngine.fingerprintWifi(bssid)
+            for (pkt in 0 until 10) {
+                tracker.ingest(
+                    RfMeasurement(
+                        macAddress = bssid,
+                        displayName = "AP-$i",
+                        transport = EmitterTransport.WIFI,
+                        rssiDbm = -58 - (i % 15) - (pkt % 3),
+                        timestampElapsedMs = ts,
+                        fingerprintHash = fp
+                    ),
+                    stationaryPose,
+                    omniCal
+                )
+                ts += 50L
+            }
+        }
+
+        val snap = tracker.snapshot(ts + 100L, stationaryPose, omniCal)
+        assertEquals(25, snap.size)
+
+        // 1. ZERO emitters may promote past SEMICIRCLE while stationary in Omni 0dB
+        for (emitter in snap) {
+            assertEquals(
+                "Stationary Omni emitter ${emitter.displayName} falsely promoted to ${emitter.shapeStage}",
+                EmitterShapeStage.SEMICIRCLE,
+                emitter.shapeStage
+            )
+            assertEquals(180.0f, emitter.angularSpreadDeg, 1e-3f)
+        }
+
+        // 2. Bearings must NOT stack onto the phone's 130 deg heading laser line;
+        //    deterministic hash angles must span wide circular azimuth (> 240 deg across 25 APs)
+        val plottedBearings = snap.map { it.peakBearingRad }
+        val bearingSpan = BackgroundEmitterTracker.computeSampledHeadingSpanDegrees(plottedBearings)
+        assertTrue(
+            "Expected hash-distributed stationary bearings spanning > 240 deg, was $bearingSpan",
+            bearingSpan > 240.0f
+        )
+        val alignedCount = plottedBearings.count {
+            kotlin.math.abs(com.example.dsp.AngleMath.wrapAngle(it - stationaryHeadingRad)) < Math.toRadians(10.0)
+        }
+        assertTrue(
+            "Too many stationary emitters ($alignedCount/25) stacked near phone heading",
+            alignedCount < 6
+        )
     }
 
     @Test
@@ -238,6 +335,14 @@ class Part1EnginesTest {
     fun cellularAndGnssMonitors_detect2gDowngradeJammingAndSpoofing() {
         // LTE Timing Advance distance
         assertEquals(781.2f, CellularMonitor.lteTimingAdvanceToMeters(10)!!, 0.1f)
+        // Canadian MCC-MNC carrier lookups & band derivation
+        assertEquals("Rogers Wireless (CA)", CellularMonitor.lookupCarrierName("302-720"))
+        assertEquals("Telus Mobility (CA)", CellularMonitor.lookupCarrierName("302-220"))
+        assertEquals("Bell Mobility (CA)", CellularMonitor.lookupCarrierName("302-610"))
+        assertEquals("Freedom Mobile (CA)", CellularMonitor.lookupCarrierName("302-490"))
+        assertEquals("B66 (1700/2100 AWS-3)", CellularMonitor.deriveBandLabel(CellRadioGeneration.LTE_4G, 66786, emptyList()))
+        assertEquals("n78 (3500 MHz C-Band)", CellularMonitor.deriveBandLabel(CellRadioGeneration.NR_5G, 640000, emptyList()))
+        assertEquals("n78", CellularMonitor.deriveBandLabel(CellRadioGeneration.NR_5G, 640000, listOf(78)))
         // 2G downgrade Stingray alert after prior 4G/5G session
         val (alert, _) = CellularMonitor.evaluate2gDowngradeAlert(
             previouslyObservedModernRat = true,

@@ -3,6 +3,7 @@ package com.example.dsp
 import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.pow
 import kotlin.math.sin
 
@@ -29,6 +30,9 @@ class BackgroundEmitterTracker {
         private const val MIN_EST_DISTANCE_M = 0.5
         private const val MAX_EST_DISTANCE_M = 35.0
         private const val EXPIRY_MS = 45_000L
+        const val MIN_HEADING_SPAN_FOR_BEARING_DEG = 180.0f
+        const val MIN_RSSI_CONTRAST_DB = 4
+        const val MIN_OMNI_BASELINE_METERS = 4.0
 
         fun classifyShapeStage(
             angularSpreadDeg: Float,
@@ -69,6 +73,51 @@ class BackgroundEmitterTracker {
             return (360.0 - maxGap).toFloat().coerceIn(0.0f, 360.0f)
         }
 
+        /**
+         * Measures actual heading diversity across all observations of an emitter.
+         * Returns 0 deg when stationary or observed from a single heading so stationary
+         * readings cannot falsely collapse angularSpread to 0 deg.
+         */
+        fun computeSampledHeadingSpanDegrees(anglesRad: List<Double>): Float {
+            if (anglesRad.size <= 1) return 0.0f
+            return computeCircularSpreadDegrees(anglesRad)
+        }
+
+        /** Maximum Euclidean baseline walked across sightings of an emitter (meters). */
+        fun computeWalkedBaselineMeters(points: List<Pair<Double, Double>>): Double {
+            if (points.size <= 1) return 0.0
+            var maxDist = 0.0
+            for (i in points.indices) {
+                val (x1, y1) = points[i]
+                for (j in i + 1 until points.size) {
+                    val (x2, y2) = points[j]
+                    val d = hypot(x2 - x1, y2 - y1)
+                    if (d > maxDist) maxDist = d
+                }
+            }
+            return maxDist
+        }
+
+        /**
+         * Deterministic hash-derived bearing in (-pi, pi] used to distribute emitters
+         * evenly around their estimated path-loss range ring while bearing is unknown,
+         * preventing stationary emitters from stacking into a single-line laser beam.
+         */
+        fun deterministicHashBearingRad(fingerprintHash: String): Double {
+            // 32-bit FNV-1a + avalanche finalizer for uniform angular spread even on adjacent BSSIDs
+            var h = 0x811c9dc5u
+            for (ch in fingerprintHash) {
+                h = (h xor ch.code.toUInt()) * 0x01000193u
+            }
+            h = h xor (h shr 16)
+            h *= 0x85ebca6bu
+            h = h xor (h shr 13)
+            h *= 0xc2b2ae35u
+            h = h xor (h shr 16)
+            val frac = h.toDouble() / 4294967296.0 // [0.0, 1.0)
+            return AngleMath.wrapAngle(frac * 2.0 * PI)
+        }
+
         fun computeCircularMeanRad(anglesRad: List<Double>): Double {
             if (anglesRad.isEmpty()) return PI / 2.0
             var sumCos = 0.0
@@ -101,7 +150,8 @@ class BackgroundEmitterTracker {
         val rssiDbm: Int,
         val headingRad: Double,
         val userX: Double,
-        val userY: Double
+        val userY: Double,
+        val shieldActive: Boolean
     )
 
     private class TrackedEntry(
@@ -128,6 +178,15 @@ class BackgroundEmitterTracker {
         synchronized(lock) {
             savedMacs.clear()
             macs.forEach { savedMacs.add(it.uppercase()) }
+            if (savedMacs.isEmpty()) {
+                savedFingerprints.clear()
+            } else {
+                // Unpin fingerprints whose observed MACs are no longer in the persisted SQLite log
+                savedFingerprints.retainAll { fp ->
+                    val entry = entries[fp]
+                    entry == null || entry.observedMacs.keys.any { it in savedMacs }
+                }
+            }
         }
     }
 
@@ -179,6 +238,8 @@ class BackgroundEmitterTracker {
             CalibrationPresetApplier.applyBleTxPowerOverride(calibration, tx).txPowerP0Dbm.toDouble()
         }
         val macUpper = measurement.macAddress.uppercase()
+        val isShieldActive = calibration.shieldDropDb > 0.0f &&
+            !(userPose.hasOrientationReading && userPose.isShieldTiltGuarded)
 
         synchronized(lock) {
             val existing = entries[fp]
@@ -205,7 +266,8 @@ class BackgroundEmitterTracker {
                         rssiDbm = rssiInt,
                         headingRad = userPose.headingRad,
                         userX = userPose.xMeters,
-                        userY = userPose.yMeters
+                        userY = userPose.yMeters,
+                        shieldActive = isShieldActive
                     )
                 )
                 entries[fp] = created
@@ -237,7 +299,8 @@ class BackgroundEmitterTracker {
                         rssiDbm = rssiInt,
                         headingRad = userPose.headingRad,
                         userX = userPose.xMeters,
-                        userY = userPose.yMeters
+                        userY = userPose.yMeters,
+                        shieldActive = isShieldActive
                     )
                 )
                 while (existing.sightings.size > MAX_SIGHTINGS_PER_EMITTER) {
@@ -251,7 +314,8 @@ class BackgroundEmitterTracker {
         nowElapsedMs: Long,
         userPose: UserPose,
         calibration: CalibrationParams,
-        lockedMac: String? = null
+        lockedMac: String? = null,
+        lockedFingerprint: String? = null
     ): List<BackgroundEmitter> {
         synchronized(lock) {
             val result = ArrayList<BackgroundEmitter>(entries.size)
@@ -260,8 +324,9 @@ class BackgroundEmitterTracker {
                 val entry = iter.next().value
                 val isPinnedByLog = entry.fingerprintHash in savedFingerprints ||
                     entry.observedMacs.keys.any { it in savedMacs }
-                val isLocked = lockedMac != null &&
-                    (entry.latestMacAddress == lockedMac || lockedMac.uppercase() in entry.observedMacs)
+                val isLocked = (lockedFingerprint != null && entry.fingerprintHash == lockedFingerprint) ||
+                    (lockedMac != null &&
+                        (entry.latestMacAddress == lockedMac || lockedMac.uppercase() in entry.observedMacs))
                 if (!isLocked && !isPinnedByLog && (nowElapsedMs - entry.lastSeenElapsedMs) > EXPIRY_MS) {
                     iter.remove()
                     continue
@@ -275,34 +340,67 @@ class BackgroundEmitterTracker {
                     pathLossExponentN = calibration.pathLossExponentN.toDouble()
                 )
 
-                val threshold = entry.maxRssiDbm - STRONG_SIGHTING_MARGIN_DB
-                val strongSightings = entry.sightings.filter { it.rssiDbm >= threshold }
-                val strongAngles = strongSightings.map { it.headingRad }
+                val windowMaxRssi = entry.sightings.maxOfOrNull { it.rssiDbm } ?: entry.maxRssiDbm
+                val windowMinRssi = entry.sightings.minOfOrNull { it.rssiDbm } ?: windowMaxRssi
+                val rssiContrastDb = windowMaxRssi - windowMinRssi
 
-                val spreadDeg = computeCircularSpreadDegrees(strongAngles)
-                val meanBearing = computeCircularMeanRad(strongAngles)
+                val allHeadings = entry.sightings.map { it.headingRad }
+                val sampledHeadingSpanDeg = computeSampledHeadingSpanDegrees(allHeadings)
+                val walkedBaselineMeters = computeWalkedBaselineMeters(
+                    entry.sightings.map { it.userX to it.userY }
+                )
+                val hasShieldedObservation = entry.sightings.any { it.shieldActive } ||
+                    (calibration.shieldDropDb > 0.0f && !(userPose.hasOrientationReading && userPose.isShieldTiltGuarded))
 
-                val anchorX = if (strongSightings.isNotEmpty()) {
-                    strongSightings.map { it.userX }.average()
+                // Require directional shielding (or >= 4.0m walked baseline in Omni 0dB) PLUS
+                // >= 180 deg sampled heading diversity AND >= 4 dB RSSI contrast before
+                // assigning a directional bearing or promoting past SEMICIRCLE.
+                val hasDirectionalEvidence =
+                    (hasShieldedObservation || walkedBaselineMeters >= MIN_OMNI_BASELINE_METERS) &&
+                        sampledHeadingSpanDeg >= MIN_HEADING_SPAN_FOR_BEARING_DEG &&
+                        rssiContrastDb >= MIN_RSSI_CONTRAST_DB
+
+                val spreadDeg: Float
+                val meanBearing: Double
+                val anchorX: Double
+                val anchorY: Double
+                val stage: EmitterShapeStage
+
+                if (!hasDirectionalEvidence) {
+                    spreadDeg = 180.0f
+                    meanBearing = deterministicHashBearingRad(entry.fingerprintHash)
+                    anchorX = userPose.xMeters
+                    anchorY = userPose.yMeters
+                    stage = if (isPinnedByLog) EmitterShapeStage.PINNED else EmitterShapeStage.SEMICIRCLE
                 } else {
-                    userPose.xMeters
-                }
-                val anchorY = if (strongSightings.isNotEmpty()) {
-                    strongSightings.map { it.userY }.average()
-                } else {
-                    userPose.yMeters
+                    val threshold = windowMaxRssi - STRONG_SIGHTING_MARGIN_DB
+                    val strongSightings = entry.sightings.filter { it.rssiDbm >= threshold }
+                    val strongAngles = strongSightings.map { it.headingRad }
+
+                    spreadDeg = computeCircularSpreadDegrees(strongAngles)
+                    meanBearing = computeCircularMeanRad(strongAngles)
+
+                    anchorX = if (strongSightings.isNotEmpty()) {
+                        strongSightings.map { it.userX }.average()
+                    } else {
+                        userPose.xMeters
+                    }
+                    anchorY = if (strongSightings.isNotEmpty()) {
+                        strongSightings.map { it.userY }.average()
+                    } else {
+                        userPose.yMeters
+                    }
+                    stage = classifyShapeStage(
+                        angularSpreadDeg = spreadDeg,
+                        estimatedDistanceMeters = estDist.toFloat(),
+                        isSavedInLog = isPinnedByLog
+                    )
                 }
 
                 val estX = (anchorX + estDist * cos(meanBearing))
                     .coerceIn(0.5, BayesianGridFilter.ARENA_SIZE_METERS - 0.5)
                 val estY = (anchorY + estDist * sin(meanBearing))
                     .coerceIn(0.5, BayesianGridFilter.ARENA_SIZE_METERS - 0.5)
-
-                val stage = classifyShapeStage(
-                    angularSpreadDeg = spreadDeg,
-                    estimatedDistanceMeters = estDist.toFloat(),
-                    isSavedInLog = isPinnedByLog
-                )
 
                 result.add(
                     BackgroundEmitter(

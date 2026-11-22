@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import android.net.wifi.ScanResult
 import android.os.SystemClock
@@ -23,6 +24,7 @@ import com.example.dsp.EmitterDossierData
 import com.example.dsp.EmitterTransport
 import com.example.dsp.EnvironmentPreset
 import com.example.dsp.GridSnapshot
+import com.example.dsp.HampelRssiFilter
 import com.example.dsp.HardwareStatus
 import com.example.dsp.MagneticFieldStatus
 import com.example.dsp.PowerMode
@@ -65,6 +67,8 @@ import kotlin.math.abs
 data class RadarUiState(
     val hasPermissions: Boolean = false,
     val missingPermissions: List<String> = emptyList(),
+    val hasCompletedFirstRunWalkthrough: Boolean = false,
+    val isSweepStarted: Boolean = false,
     val hardwareStatus: HardwareStatus = HardwareStatus(),
     val userPose: UserPose = UserPose(),
     val magneticStatus: MagneticFieldStatus = MagneticFieldStatus(),
@@ -73,6 +77,7 @@ data class RadarUiState(
     val activePresets: ActivePresetState = ActivePresetState(),
     val powerMode: PowerMode = PowerMode.TURBO,
     val mapOverlayEnabled: Boolean = true,
+    val showBackgroundPins: Boolean = true,
     val discoveredEmitters: List<DiscoveredEmitter> = emptyList(),
     val backgroundEmitters: List<BackgroundEmitter> = emptyList(),
     val sweepCoachState: SweepCoachState = SweepCoachState(),
@@ -127,6 +132,8 @@ class RadarViewModel(
 ) : AndroidViewModel(application) {
 
     companion object {
+        private const val PREFS_NAME = "sigseeker_prefs"
+        private const val KEY_WALKTHROUGH_COMPLETED = "has_completed_walkthrough"
         private const val RATE_WINDOW_MS = 4_000L
         private const val EMITTER_EXPIRY_MS = 35_000L
         private const val STALE_TARGET_MS = 5_000L
@@ -134,11 +141,28 @@ class RadarViewModel(
         private const val MAX_INTERVAL_SAMPLES = 24
     }
 
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val geigerEngine = GeigerFeedbackEngine(application, viewModelScope)
     private val cellularMonitor = CellularMonitor(application, viewModelScope)
     private val gnssRfMonitor = GnssRfMonitor(application)
+    private val lockedTargetHampelFilter = HampelRssiFilter()
 
-    private val _uiState = MutableStateFlow(RadarUiState())
+    private val _uiState = MutableStateFlow(
+        RadarUiState(
+            hasCompletedFirstRunWalkthrough = prefs.getBoolean(KEY_WALKTHROUGH_COMPLETED, false),
+            isSweepStarted = false,
+            calibration = CalibrationParams(
+                shieldDropDb = ShieldPreset.OMNI_HANDHELD.shieldDropDb,
+                pathLossExponentN = EnvironmentPreset.INDOORS_DRYWALL.pathLossExponentN,
+                stepLengthMeters = EnvironmentPreset.INDOORS_DRYWALL.stepLengthMeters
+            ),
+            activePresets = ActivePresetState(
+                shieldPreset = ShieldPreset.OMNI_HANDHELD,
+                environmentPreset = EnvironmentPreset.INDOORS_DRYWALL,
+                screenOutwardMode = false
+            )
+        )
+    )
     val uiState: StateFlow<RadarUiState> = _uiState.asStateFlow()
 
     private val _statusMessages = MutableSharedFlow<String>(extraBufferCapacity = 8)
@@ -149,6 +173,9 @@ class RadarViewModel(
 
     @Volatile
     private var lockedMac: String? = null
+
+    @Volatile
+    private var lockedFingerprint: String? = null
 
     @Volatile
     private var lockedScanResult: ScanResult? = null
@@ -195,7 +222,7 @@ class RadarViewModel(
             hasWifiRtt = standaloneSource.hasWifiRttCapability,
             hasBleScanner = standaloneSource.hasBleCapability,
             hasRotationVector = imuEngine.hasRotationVector,
-            hasStepDetector = imuEngine.hasStepDetector,
+            hasStepDetector = imuEngine.hasStepDetector && PermissionHelper.hasActivityRecognitionPermission(ctx),
             hasMagnetometer = imuEngine.hasMagnetometer,
             usbBridgeAttached = optionalUsbSource.isAvailable
         )
@@ -206,17 +233,68 @@ class RadarViewModel(
                 hardwareStatus = hw
             )
         }
-        if (hasCore) {
+        // Strict Cold-Launch Gate: do NOT auto-start radio/grid ingestion until user taps START SWEEP
+        if (hasCore && _uiState.value.isSweepStarted) {
             offlineMapTileManager.refreshAnchorFromLocationManager()
             startSensorsAndRadios()
         }
     }
 
-    fun onActivityStarted() {
-        refreshHardwareAndPermissionState()
+    fun completeFirstRunWalkthrough() {
+        prefs.edit().putBoolean(KEY_WALKTHROUGH_COMPLETED, true).apply()
+        _uiState.update { it.copy(hasCompletedFirstRunWalkthrough = true) }
+    }
+
+    fun reopenFirstRunWalkthrough() {
+        _uiState.update { it.copy(hasCompletedFirstRunWalkthrough = false) }
+    }
+
+    fun startSweepWithSetup(holdMode: SetupHoldMode, environment: EnvironmentPreset) {
+        val baseCal = CalibrationParams(
+            shieldDropDb = holdMode.shieldPreset.shieldDropDb,
+            pathLossExponentN = environment.pathLossExponentN,
+            stepLengthMeters = environment.stepLengthMeters
+        )
+        imuEngine.updateStepLength(environment.stepLengthMeters)
+        imuEngine.setScreenOutwardMode(holdMode.screenOutwardMode)
+        imuEngine.resetPoseToCenter()
+
+        bayesianGridFilter.resetToUniform()
+        backgroundEmitterTracker.clear()
+        lockedTargetHampelFilter.reset()
+        synchronized(registryLock) {
+            emitterRegistry.clear()
+        }
+        gridDirty = true
+
+        val pose = imuEngine.pose.value
+        _uiState.update { state ->
+            state.copy(
+                isSweepStarted = true,
+                calibration = baseCal,
+                activePresets = ActivePresetState(
+                    shieldPreset = holdMode.shieldPreset,
+                    emitterClassPreset = null,
+                    environmentPreset = environment,
+                    autoOverriddenTxPowerDbm = null,
+                    screenOutwardMode = holdMode.screenOutwardMode
+                ),
+                userPose = pose,
+                gridSnapshot = bayesianGridFilter.createSnapshot(pose.xMeters, pose.yMeters),
+                discoveredEmitters = emptyList(),
+                backgroundEmitters = emptyList()
+            )
+        }
+
         if (_uiState.value.hasPermissions) {
+            offlineMapTileManager.refreshAnchorFromLocationManager()
             startSensorsAndRadios()
         }
+        _statusMessages.tryEmit("Sweep started · ${holdMode.title} · ${environment.shortLabel}")
+    }
+
+    fun onActivityStarted() {
+        refreshHardwareAndPermissionState()
     }
 
     fun onActivityStopped() {
@@ -346,7 +424,13 @@ class RadarViewModel(
         }
 
         val currentLocked = lockedMac ?: return
-        if (m.macAddress != currentLocked) return
+        val currentFp = lockedFingerprint
+        val matchesLocked = m.macAddress == currentLocked ||
+            (currentFp != null && currentFp.startsWith("BLE_FP:") && m.fingerprintHash == currentFp)
+        if (!matchesLocked) return
+        if (m.macAddress != currentLocked) {
+            lockedMac = m.macAddress
+        }
 
         if (m.scanResult != null) {
             lockedScanResult = m.scanResult
@@ -382,12 +466,15 @@ class RadarViewModel(
                 sigmaRttMeters = effectiveParams.sigmaRttMeters
             )
         } else {
+            val hampelFilteredRssi = lockedTargetHampelFilter.update(m.rssiDbm.toDouble())
+            val tiltGuardActive = pose.hasOrientationReading && pose.isShieldTiltGuarded
             bayesianGridFilter.updateWithShieldedRssi(
                 userX = pose.xMeters,
                 userY = pose.yMeters,
                 userHeadingRad = pose.headingRad,
-                measuredRssiDbm = m.rssiDbm.toDouble(),
-                params = effectiveParams
+                measuredRssiDbm = hampelFilteredRssi,
+                params = effectiveParams,
+                tiltGuardActive = tiltGuardActive
             )
         }
 
@@ -400,6 +487,7 @@ class RadarViewModel(
 
         _uiState.update { state ->
             state.copy(
+                lockedTargetMac = m.macAddress,
                 lockedTargetLastRssiDbm = m.rssiDbm,
                 lockedTargetKalmanRssiDbm = smoothedRssi.toFloat(),
                 lockedTargetLastRttMeters = rttDist ?: state.lockedTargetLastRttMeters,
@@ -453,7 +541,8 @@ class RadarViewModel(
                         nowElapsedMs = now,
                         userPose = pose,
                         calibration = _uiState.value.calibration,
-                        lockedMac = targetMac
+                        lockedMac = targetMac,
+                        lockedFingerprint = lockedFingerprint
                     )
                 } else {
                     null
@@ -519,7 +608,9 @@ class RadarViewModel(
             while (iterator.hasNext()) {
                 val entry = iterator.next()
                 val rec = entry.value
-                if (rec.macAddress != lockedMac && (nowElapsedMs - rec.lastSeenElapsedMs) > EMITTER_EXPIRY_MS) {
+                val isCurrentlyLocked = rec.macAddress == lockedMac ||
+                    (lockedFingerprint != null && rec.fingerprintHash == lockedFingerprint)
+                if (!isCurrentlyLocked && (nowElapsedMs - rec.lastSeenElapsedMs) > EMITTER_EXPIRY_MS) {
                     iterator.remove()
                     continue
                 }
@@ -696,11 +787,13 @@ class RadarViewModel(
      */
     fun lockTarget(emitter: DiscoveredEmitter) {
         lockedMac = emitter.macAddress
+        lockedFingerprint = emitter.fingerprintHash
         lockedScanResult = emitter.scanResult
         lastLockedPacketElapsedMs = SystemClock.elapsedRealtime()
         sessionMinDist = null
         sessionMaxRssi = emitter.rssiDbm
 
+        lockedTargetHampelFilter.reset()
         bayesianGridFilter.resetToUniform()
         gridDirty = true
 
@@ -762,6 +855,7 @@ class RadarViewModel(
 
     fun unlockTarget() {
         lockedMac = null
+        lockedFingerprint = null
         lockedScanResult = null
         lastLockedPacketElapsedMs = 0L
         sessionMinDist = null
@@ -769,6 +863,7 @@ class RadarViewModel(
         rttPollingJob?.cancel()
         rttPollingJob = null
 
+        lockedTargetHampelFilter.reset()
         bayesianGridFilter.resetToUniform()
         sweepCoachEngine.reset()
         gridDirty = true
@@ -800,6 +895,7 @@ class RadarViewModel(
     }
 
     fun resetGridAndPose() {
+        lockedTargetHampelFilter.reset()
         bayesianGridFilter.resetToUniform()
         imuEngine.resetPoseToCenter()
         sessionMinDist = null
@@ -859,6 +955,14 @@ class RadarViewModel(
         _uiState.update { it.copy(mapOverlayEnabled = next) }
     }
 
+    fun toggleBackgroundPins() {
+        val next = !_uiState.value.showBackgroundPins
+        _uiState.update { it.copy(showBackgroundPins = next) }
+        _statusMessages.tryEmit(
+            if (next) "Background signal pins visible" else "Background signal pins hidden (declutter)"
+        )
+    }
+
     fun triggerManualWifiScan() {
         val initiated = standaloneSource.triggerWifiScan()
         if (initiated) {
@@ -883,6 +987,20 @@ class RadarViewModel(
             )
         }
         _statusMessages.tryEmit("Carrying mode: ${preset.displayName} (${preset.shieldDropDb.toInt()} dB)")
+    }
+
+    fun toggleScreenOutwardMode() {
+        val next = !_uiState.value.activePresets.screenOutwardMode
+        imuEngine.setScreenOutwardMode(next)
+        _uiState.update { state ->
+            state.copy(
+                activePresets = state.activePresets.copy(screenOutwardMode = next)
+            )
+        }
+        _statusMessages.tryEmit(
+            if (next) "Screen Outward (+180°) enabled for breast-pocket carry"
+            else "Default Rear-Camera (-Z) forward axis active"
+        )
     }
 
     fun applyEmitterClassPreset(preset: EmitterClassPreset) {
@@ -958,6 +1076,7 @@ class RadarViewModel(
     fun restoreDefaultCalibration() {
         val defaults = CalibrationParams()
         imuEngine.updateStepLength(defaults.stepLengthMeters)
+        imuEngine.setScreenOutwardMode(false)
         _uiState.update {
             it.copy(
                 calibration = defaults,
@@ -1018,7 +1137,8 @@ class RadarViewModel(
             nowElapsedMs = SystemClock.elapsedRealtime(),
             userPose = state.userPose,
             calibration = state.calibration,
-            lockedMac = mac
+            lockedMac = mac,
+            lockedFingerprint = state.lockedTargetFingerprint
         )
         _uiState.update { it.copy(backgroundEmitters = immediateBg) }
 
@@ -1076,6 +1196,9 @@ class RadarViewModel(
         poseObserverJob?.cancel()
         auxiliaryMonitorsJob?.cancel()
         geigerEngine.release()
+        standaloneSource.shutdown()
+        cellularMonitor.shutdown()
+        gnssRfMonitor.shutdown()
     }
 
     class Factory(private val application: Application) : ViewModelProvider.Factory {

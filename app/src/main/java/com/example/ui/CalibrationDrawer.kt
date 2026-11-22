@@ -42,6 +42,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.dsp.ActivePresetState
@@ -75,6 +76,7 @@ fun CalibrationDrawer(
     expanded: Boolean,
     onToggleExpanded: () -> Unit,
     onApplyShieldPreset: (ShieldPreset) -> Unit,
+    onToggleScreenOutward: () -> Unit,
     onApplyEmitterClassPreset: (EmitterClassPreset) -> Unit,
     onApplyEnvironmentPreset: (EnvironmentPreset) -> Unit,
     onShieldDropChange: (Float) -> Unit,
@@ -110,11 +112,12 @@ fun CalibrationDrawer(
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "CALIBRATION & PRESETS",
+                text = "CALIBRATION",
                 style = MaterialTheme.typography.titleSmall,
-                color = ReadoutInkPrimary
+                color = ReadoutInkPrimary,
+                maxLines = 1
             )
-            Spacer(modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = String.format(
                     Locale.US,
@@ -125,7 +128,10 @@ fun CalibrationDrawer(
                     calibration.stepLengthMeters
                 ),
                 style = MaterialTheme.typography.labelSmall,
-                color = ReadoutInkSecondary
+                color = ReadoutInkSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
             )
             Spacer(modifier = Modifier.width(6.dp))
             Icon(
@@ -151,7 +157,11 @@ fun CalibrationDrawer(
                 // One-Tap Carrying / Shield Presets (0..30 dB)
                 PresetGroupHeader(
                     title = "CARRYING / SHIELD PRESET (A_max)",
-                    badgeText = activePresets.shieldPreset?.shortLabel ?: "CUSTOM"
+                    badgeText = buildString {
+                        append(activePresets.shieldPreset?.shortLabel ?: "CUSTOM")
+                        if (activePresets.screenOutwardMode) append(" · +180°")
+                    },
+                    badgeColor = if (activePresets.screenOutwardMode) ThermalAmber else ReadoutInkSecondary
                 )
                 Row(
                     modifier = Modifier
@@ -168,6 +178,13 @@ fun CalibrationDrawer(
                             onClick = { onApplyShieldPreset(preset) }
                         )
                     }
+                    PresetChip(
+                        label = "Screen Outward (+180°)",
+                        selected = activePresets.screenOutwardMode,
+                        accent = ThermalAmber,
+                        testTag = "toggle_screen_outward",
+                        onClick = onToggleScreenOutward
+                    )
                 }
 
                 // One-Tap Emitter Class Presets (P0)

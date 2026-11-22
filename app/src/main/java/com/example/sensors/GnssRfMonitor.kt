@@ -262,4 +262,9 @@ class GnssRfMonitor(context: Context) {
         analyzer.reset()
         _status.value = GnssRfStatus()
     }
+
+    fun shutdown() {
+        stop()
+        gnssExecutor.shutdownNow()
+    }
 }

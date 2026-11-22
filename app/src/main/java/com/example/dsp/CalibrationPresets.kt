@@ -92,7 +92,9 @@ data class ActivePresetState(
     val emitterClassPreset: EmitterClassPreset? = null,
     val environmentPreset: EnvironmentPreset? = null,
     /** Non-null when a BLE 0x0A TX Power advertisement automatically overrode P0. */
-    val autoOverriddenTxPowerDbm: Int? = null
+    val autoOverriddenTxPowerDbm: Int? = null,
+    /** Manual +180 deg heading flip for placing the phone screen-outward in a breast pocket. */
+    val screenOutwardMode: Boolean = false
 )
 
 object CalibrationPresetApplier {

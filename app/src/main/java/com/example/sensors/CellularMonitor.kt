@@ -46,8 +46,12 @@ data class CellTowerInfo(
     val isServing: Boolean,
     val pci: Int?,
     val rsrpDbm: Int?,
+    val rsrqDb: Int? = null,
     val sinrDb: Int?,
     val arfcn: Int?,
+    val bands: List<Int> = emptyList(),
+    val cellIdentityId: Long? = null,
+    val tacOrLac: Int? = null,
     val timingAdvance: Int?,
     val timingAdvanceDistanceMeters: Float?,
     val plmn: String?
@@ -79,11 +83,109 @@ class CellularMonitor(
 ) {
     companion object {
         private const val UNAVAILABLE_INT = Int.MAX_VALUE
+        private const val UNAVAILABLE_LONG = Long.MAX_VALUE
         // 3GPP TS 36.213 LTE Timing Advance step = 16 * Ts * c / 2 ≈ 78.12 meters per unit
         const val LTE_TA_METERS_PER_UNIT = 78.12f
         // 3GPP TS 45.010 GSM Timing Advance step ≈ 553.8 meters per unit
         const val GSM_TA_METERS_PER_UNIT = 553.8f
         private const val POLL_INTERVAL_MS = 4_000L
+
+        private val CARRIER_PLMN_MAP = mapOf(
+            // Canada (MCC 302)
+            "302-720" to "Rogers Wireless (CA)",
+            "302-320" to "Rogers / Chatr (CA)",
+            "302-370" to "Fido / Rogers (CA)",
+            "302-220" to "Telus Mobility (CA)",
+            "302-221" to "Telus Mobility (CA)",
+            "302-610" to "Bell Mobility (CA)",
+            "302-640" to "Bell Mobility (CA)",
+            "302-880" to "Bell / Telus Shared RAN (CA)",
+            "302-490" to "Freedom Mobile (CA)",
+            "302-500" to "Vidéotron (CA)",
+            "302-510" to "Vidéotron (CA)",
+            "302-780" to "SaskTel (CA)",
+            "302-620" to "ICE Wireless (CA)",
+            "302-710" to "Globalstar Canada",
+            // United States (MCC 310/311)
+            "310-410" to "AT&T Mobility (US)",
+            "310-260" to "T-Mobile (US)",
+            "311-480" to "Verizon Wireless (US)",
+            "310-120" to "T-Mobile / Sprint (US)"
+        )
+
+        fun lookupCarrierName(plmn: String?): String? {
+            if (plmn.isNullOrBlank()) return null
+            val normalized = plmn.trim()
+            CARRIER_PLMN_MAP[normalized]?.let { return it }
+            // Normalize 2-digit vs 3-digit MNC variations (e.g., 302-720)
+            val parts = normalized.split('-')
+            if (parts.size == 2) {
+                val mcc = parts[0]
+                val mncPadded = parts[1].padStart(3, '0')
+                CARRIER_PLMN_MAP["$mcc-$mncPadded"]?.let { return it }
+                if (mcc == "302") return "Canadian Carrier ($normalized)"
+                if (mcc == "310" || mcc == "311") return "US Carrier ($normalized)"
+            }
+            return null
+        }
+
+        fun deriveBandLabel(
+            generation: CellRadioGeneration,
+            arfcn: Int?,
+            reportedBands: List<Int>
+        ): String {
+            if (reportedBands.isNotEmpty()) {
+                val prefix = if (generation == CellRadioGeneration.NR_5G) "n" else "B"
+                return reportedBands.joinToString(", ") { "$prefix$it" }
+            }
+            if (arfcn == null) return "Unknown Band"
+            return when (generation) {
+                CellRadioGeneration.LTE_4G -> when (arfcn) {
+                    in 0..599 -> "B1 (2100 MHz)"
+                    in 600..1199 -> "B2 (1900 MHz PCS)"
+                    in 1200..1949 -> "B3 (1800 MHz)"
+                    in 1950..2399 -> "B4 (1700/2100 AWS)"
+                    in 2400..2649 -> "B5 (850 MHz)"
+                    in 2750..3449 -> "B7 (2600 MHz)"
+                    in 3450..3799 -> "B8 (900 MHz)"
+                    in 5010..5179 -> "B12 (700 MHz)"
+                    in 5180..5279 -> "B13 (700 MHz)"
+                    in 5730..5849 -> "B17 (700 MHz)"
+                    in 8040..8689 -> "B25 (1900 MHz)"
+                    in 9210..9659 -> "B28 (700 MHz)"
+                    in 9660..9769 -> "B29 (700 MHz DL)"
+                    in 9770..9869 -> "B30 (2300 MHz)"
+                    in 37750..38249 -> "B38 (2600 TDD)"
+                    in 39650..41589 -> "B41 (2500 TDD)"
+                    in 66436..67335 -> "B66 (1700/2100 AWS-3)"
+                    in 68586..68935 -> "B71 (600 MHz)"
+                    else -> "EARFCN $arfcn"
+                }
+
+                CellRadioGeneration.NR_5G -> when (arfcn) {
+                    in 123400..130400 -> "n71 (600 MHz)"
+                    in 173800..178800 -> "n5 (850 MHz)"
+                    in 386000..398000 -> "n2 (1900 MHz)"
+                    in 422000..440000 -> "n66 (AWS)"
+                    in 499200..537999 -> "n41 (2500 MHz)"
+                    in 524000..538000 -> "n7 (2600 MHz)"
+                    in 620000..653333 -> "n78 (3500 MHz C-Band)"
+                    in 620000..680000 -> "n77 (3700 MHz C-Band)"
+                    else -> "NR-ARFCN $arfcn"
+                }
+
+                CellRadioGeneration.WCDMA_3G -> "UARFCN $arfcn"
+                CellRadioGeneration.GSM_2G -> "GSM ARFCN $arfcn"
+            }
+        }
+
+        fun rsrpQualitySummary(rsrpDbm: Int?): String = when {
+            rsrpDbm == null -> "Unavailable"
+            rsrpDbm >= -80 -> "Excellent (very strong / close tower)"
+            rsrpDbm >= -95 -> "Good (solid urban/suburban coverage)"
+            rsrpDbm >= -110 -> "Fair (mid-cell or indoor attenuation)"
+            else -> "Weak (cell edge or heavy obstruction)"
+        }
 
         fun lteTimingAdvanceToMeters(ta: Int?): Float? {
             if (ta == null || ta < 0 || ta > 1282 || ta == UNAVAILABLE_INT) return null
@@ -136,11 +238,14 @@ class CellularMonitor(
         private fun networkTypeName(type: Int): String = when (type) {
             TelephonyManager.NETWORK_TYPE_NR -> "5G NR"
             TelephonyManager.NETWORK_TYPE_LTE -> "4G LTE"
+            19 -> "4G LTE-A (CA)" // NETWORK_TYPE_LTE_CA
+            TelephonyManager.NETWORK_TYPE_IWLAN -> "Wi-Fi (IWLAN)"
             TelephonyManager.NETWORK_TYPE_HSPAP,
             TelephonyManager.NETWORK_TYPE_HSPA,
             TelephonyManager.NETWORK_TYPE_HSDPA,
             TelephonyManager.NETWORK_TYPE_HSUPA,
-            TelephonyManager.NETWORK_TYPE_UMTS -> "3G UMTS"
+            TelephonyManager.NETWORK_TYPE_UMTS,
+            TelephonyManager.NETWORK_TYPE_TD_SCDMA -> "3G UMTS"
             TelephonyManager.NETWORK_TYPE_EDGE -> "2G EDGE"
             TelephonyManager.NETWORK_TYPE_GPRS -> "2G GPRS"
             TelephonyManager.NETWORK_TYPE_GSM -> "2G GSM"
@@ -189,6 +294,11 @@ class CellularMonitor(
     fun stop() {
         pollJob?.cancel()
         pollJob = null
+    }
+
+    fun shutdown() {
+        stop()
+        cellExecutor.shutdownNow()
     }
 
     @SuppressLint("MissingPermission")
@@ -303,17 +413,30 @@ class CellularMonitor(
             val rsrp = sig.ssRsrp.takeIf { it != UNAVAILABLE_INT && it < 0 }
                 ?: sig.csiRsrp.takeIf { it != UNAVAILABLE_INT && it < 0 }
                 ?: sig.dbm.takeIf { it != UNAVAILABLE_INT && it < 0 }
+            val rsrq = sig.ssRsrq.takeIf { it != UNAVAILABLE_INT && it <= 0 }
+                ?: sig.csiRsrq.takeIf { it != UNAVAILABLE_INT && it <= 0 }
             val sinr = sig.ssSinr.takeIf { it != UNAVAILABLE_INT }
                 ?: sig.csiSinr.takeIf { it != UNAVAILABLE_INT }
             val nrarfcn = id.nrarfcn.takeIf { it != UNAVAILABLE_INT && it >= 0 }
+            val nci = id.nci.takeIf { it != UNAVAILABLE_LONG && it >= 0L }
+            val tac = id.tac.takeIf { it != UNAVAILABLE_INT && it >= 0 }
+            val bands = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                id.bands.filter { it > 0 }
+            } else {
+                emptyList()
+            }
             val plmn = listOfNotNull(id.mccString, id.mncString).joinToString("-").ifBlank { null }
             return CellTowerInfo(
                 generation = CellRadioGeneration.NR_5G,
                 isServing = cell.isRegistered,
                 pci = pci,
                 rsrpDbm = rsrp,
+                rsrqDb = rsrq,
                 sinrDb = sinr,
                 arfcn = nrarfcn,
+                bands = bands,
+                cellIdentityId = nci,
+                tacOrLac = tac,
                 timingAdvance = null,
                 timingAdvanceDistanceMeters = null,
                 plmn = plmn
@@ -330,12 +453,24 @@ class CellularMonitor(
                 } else {
                     sig.dbm.takeIf { it != UNAVAILABLE_INT && it < 0 }
                 }
+                val rsrq = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    sig.rsrq.takeIf { it != UNAVAILABLE_INT && it <= 0 }
+                } else {
+                    null
+                }
                 val sinr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     sig.rssnr.takeIf { it != UNAVAILABLE_INT && it in -20..30 }
                 } else {
                     null
                 }
                 val earfcn = id.earfcn.takeIf { it != UNAVAILABLE_INT && it >= 0 }
+                val eci = id.ci.takeIf { it != UNAVAILABLE_INT && it >= 0 }?.toLong()
+                val tac = id.tac.takeIf { it != UNAVAILABLE_INT && it >= 0 }
+                val bands = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    id.bands.filter { it > 0 }
+                } else {
+                    emptyList()
+                }
                 val ta = sig.timingAdvance.takeIf { it != UNAVAILABLE_INT && it in 0..1282 }
                 val plmn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     listOfNotNull(id.mccString, id.mncString).joinToString("-").ifBlank { null }
@@ -347,8 +482,12 @@ class CellularMonitor(
                     isServing = cell.isRegistered,
                     pci = pci,
                     rsrpDbm = rsrp,
+                    rsrqDb = rsrq,
                     sinrDb = sinr,
                     arfcn = earfcn,
+                    bands = bands,
+                    cellIdentityId = eci,
+                    tacOrLac = tac,
                     timingAdvance = ta,
                     timingAdvanceDistanceMeters = lteTimingAdvanceToMeters(ta),
                     plmn = plmn
@@ -360,6 +499,8 @@ class CellularMonitor(
                 val sig: CellSignalStrengthGsm = cell.cellSignalStrength
                 val rssi = sig.dbm.takeIf { it != UNAVAILABLE_INT && it < 0 }
                 val arfcn = id.arfcn.takeIf { it != UNAVAILABLE_INT && it >= 0 }
+                val cid = id.cid.takeIf { it != UNAVAILABLE_INT && it >= 0 }?.toLong()
+                val lac = id.lac.takeIf { it != UNAVAILABLE_INT && it >= 0 }
                 val ta = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     sig.timingAdvance.takeIf { it != UNAVAILABLE_INT && it in 0..63 }
                 } else {
@@ -375,8 +516,12 @@ class CellularMonitor(
                     isServing = cell.isRegistered,
                     pci = id.bsic.takeIf { it != UNAVAILABLE_INT && it >= 0 },
                     rsrpDbm = rssi,
+                    rsrqDb = null,
                     sinrDb = null,
                     arfcn = arfcn,
+                    bands = emptyList(),
+                    cellIdentityId = cid,
+                    tacOrLac = lac,
                     timingAdvance = ta,
                     timingAdvanceDistanceMeters = gsmTimingAdvanceToMeters(ta),
                     plmn = plmn
@@ -389,6 +534,8 @@ class CellularMonitor(
                 val psc = id.psc.takeIf { it != UNAVAILABLE_INT && it >= 0 }
                 val rscp = sig.dbm.takeIf { it != UNAVAILABLE_INT && it < 0 }
                 val uarfcn = id.uarfcn.takeIf { it != UNAVAILABLE_INT && it >= 0 }
+                val cid = id.cid.takeIf { it != UNAVAILABLE_INT && it >= 0 }?.toLong()
+                val lac = id.lac.takeIf { it != UNAVAILABLE_INT && it >= 0 }
                 val plmn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     listOfNotNull(id.mccString, id.mncString).joinToString("-").ifBlank { null }
                 } else {
@@ -399,8 +546,12 @@ class CellularMonitor(
                     isServing = cell.isRegistered,
                     pci = psc,
                     rsrpDbm = rscp,
+                    rsrqDb = null,
                     sinrDb = null,
                     arfcn = uarfcn,
+                    bands = emptyList(),
+                    cellIdentityId = cid,
+                    tacOrLac = lac,
                     timingAdvance = null,
                     timingAdvanceDistanceMeters = null,
                     plmn = plmn

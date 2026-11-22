@@ -27,6 +27,7 @@ class BayesianGridFilter {
         const val TOTAL_CELLS = GRID_SIZE * GRID_SIZE              // 10,000
         const val UNIFORM_PROB = 1.0 / TOTAL_CELLS                 // 1e-4
         const val UNDERFLOW_EPSILON = 1e-12
+        const val LAPLACE_SMOOTHING_ALPHA = 0.02                   // 2% uniform floor
         const val MIN_DISTANCE_METERS = 0.25
         private val MAX_ENTROPY = ln(TOTAL_CELLS.toDouble())
         private const val CEP_HISTOGRAM_BINS = 140 // 0.5m radial bins covering up to 70m diagonal
@@ -102,7 +103,8 @@ class BayesianGridFilter {
     /**
      * Tier 2 (Standalone Shielded RSSI Sweep):
      *     deltaTheta = wrap(atan2(y - y_u, x - x_u) - theta)
-     *     A_shield   = A_max * (1 - cos(deltaTheta)) / 2
+     *     A_shield   = A_eff * (1 - cos(deltaTheta)) / 2
+     *                  where A_eff = 0 when tiltGuardActive is true (|roll| > 45 deg or |pitch| < 15 deg)
      *     R_pred     = P_0 - 10 * n * log10(max(d_cell, 0.25)) - A_shield
      *     L(x, y)    = exp( - (R_meas - R_pred)^2 / (2 * sigma_rssi^2) )
      */
@@ -111,11 +113,17 @@ class BayesianGridFilter {
         userY: Double,
         userHeadingRad: Double,
         measuredRssiDbm: Double,
-        params: CalibrationParams
+        params: CalibrationParams,
+        tiltGuardActive: Boolean = false
     ) {
         if (!measuredRssiDbm.isFinite()) return
 
-        val aMax = params.shieldDropDb.toDouble()
+        val aMax = if (tiltGuardActive) {
+            0.0
+        } else {
+            params.shieldDropDb.toDouble()
+                .coerceIn(CalibrationParams.MIN_SHIELD_DB.toDouble(), CalibrationParams.MAX_SHIELD_DB.toDouble())
+        }
         val p0 = params.txPowerP0Dbm.toDouble()
         val tenN = 10.0 * params.pathLossExponentN.toDouble()
         val twoSigmaSq = 2.0 * params.sigmaRssiDb * params.sigmaRssiDb
@@ -157,8 +165,10 @@ class BayesianGridFilter {
             backBuffer.fill(UNIFORM_PROB)
         } else {
             val invTotal = 1.0 / totalWeight
+            val keepWeight = 1.0 - LAPLACE_SMOOTHING_ALPHA
+            val uniformFloor = LAPLACE_SMOOTHING_ALPHA * UNIFORM_PROB
             for (i in 0 until TOTAL_CELLS) {
-                backBuffer[i] *= invTotal
+                backBuffer[i] = keepWeight * (backBuffer[i] * invTotal) + uniformFloor
             }
         }
 

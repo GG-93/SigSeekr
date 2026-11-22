@@ -39,6 +39,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -107,8 +108,10 @@ fun RadarCanvas(
     userPose: UserPose,
     hasLockedTarget: Boolean,
     lockedTargetMac: String?,
+    lockedTargetFingerprint: String?,
     lockedTargetLabel: String?,
     backgroundEmitters: List<BackgroundEmitter>,
+    showBackgroundPins: Boolean,
     sweepCoachState: SweepCoachState,
     tileCacheState: TileCacheState,
     mapOverlayEnabled: Boolean,
@@ -203,12 +206,13 @@ fun RadarCanvas(
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(backgroundEmitters) {
+                .pointerInput(backgroundEmitters, showBackgroundPins) {
                     detectTapGestures { tapOffset ->
+                        if (!showBackgroundPins || backgroundEmitters.isEmpty()) return@detectTapGestures
                         val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS.toFloat()
                         val width = size.width.toFloat()
                         val height = size.height.toFloat()
-                        if (width <= 0f || height <= 0f || backgroundEmitters.isEmpty()) return@detectTapGestures
+                        if (width <= 0f || height <= 0f) return@detectTapGestures
 
                         var nearest: BackgroundEmitter? = null
                         var bestDist = tapRadiusPx
@@ -317,15 +321,17 @@ fun RadarCanvas(
             }
 
             // 6. 6-Stage Background Emitter Shapes (Semicircle -> Hexagon -> Pinned)
-            for (emitter in backgroundEmitters) {
-                val isCurrentlyLocked = lockedTargetMac != null &&
-                    (emitter.latestMacAddress == lockedTargetMac)
-                val pos = worldToPx(emitter.estimatedX.toDouble(), emitter.estimatedY.toDouble())
-                drawBackgroundEmitterShape(
-                    emitter = emitter,
-                    center = pos,
-                    isLocked = isCurrentlyLocked
-                )
+            if (showBackgroundPins) {
+                for (emitter in backgroundEmitters) {
+                    val isCurrentlyLocked = (lockedTargetMac != null && emitter.latestMacAddress == lockedTargetMac) ||
+                        (lockedTargetFingerprint != null && emitter.fingerprintHash == lockedTargetFingerprint)
+                    val pos = worldToPx(emitter.estimatedX.toDouble(), emitter.estimatedY.toDouble())
+                    drawBackgroundEmitterShape(
+                        emitter = emitter,
+                        center = pos,
+                        isLocked = isCurrentlyLocked
+                    )
+                }
             }
 
             // 7. User Dead-Reckoning Trail
@@ -340,65 +346,17 @@ fun RadarCanvas(
                 }
                 drawPath(
                     path = trailPath,
-                    color = ElectricCyan.copy(alpha = 0.72f),
+                    color = ObsidianBackground.copy(alpha = 0.80f),
+                    style = Stroke(width = 6.5f, cap = StrokeCap.Round)
+                )
+                drawPath(
+                    path = trailPath,
+                    color = ElectricCyan.copy(alpha = 0.85f),
                     style = Stroke(width = 3.2f, cap = StrokeCap.Round)
                 )
             }
 
-            // 8. User Position Marker, Forward Heading Cone & Rear Shield Null Arc
-            val userPx = worldToPx(userPose.xMeters, userPose.yMeters)
-            val theta = userPose.headingRad
-            val coneLength = 38f
-            val halfConeRad = Math.toRadians(24.0)
-
-            val coneTipLeft = Offset(
-                x = userPx.x + (coneLength * cos(theta + halfConeRad)).toFloat(),
-                y = userPx.y - (coneLength * sin(theta + halfConeRad)).toFloat()
-            )
-            val coneTipRight = Offset(
-                x = userPx.x + (coneLength * cos(theta - halfConeRad)).toFloat(),
-                y = userPx.y - (coneLength * sin(theta - halfConeRad)).toFloat()
-            )
-            val conePath = Path().apply {
-                moveTo(userPx.x, userPx.y)
-                lineTo(coneTipLeft.x, coneTipLeft.y)
-                lineTo(coneTipRight.x, coneTipRight.y)
-                close()
-            }
-            drawPath(path = conePath, color = ElectricCyan.copy(alpha = 0.28f))
-
-            // Rear shield null arc (behind user at theta + pi)
-            val screenHeadingDeg = (-Math.toDegrees(theta)).toFloat()
-            val shieldArcRadius = 22f
-            drawArc(
-                color = ThermalAmber.copy(alpha = 0.85f),
-                startAngle = screenHeadingDeg + 180f - 45f,
-                sweepAngle = 90f,
-                useCenter = false,
-                topLeft = Offset(userPx.x - shieldArcRadius, userPx.y - shieldArcRadius),
-                size = Size(shieldArcRadius * 2f, shieldArcRadius * 2f),
-                style = Stroke(width = 3.5f, cap = StrokeCap.Round)
-            )
-
-            // Forward heading vector needle
-            val needleEnd = Offset(
-                x = userPx.x + (26f * cos(theta)).toFloat(),
-                y = userPx.y - (26f * sin(theta)).toFloat()
-            )
-            drawLine(
-                color = ElectricCyan,
-                start = userPx,
-                end = needleEnd,
-                strokeWidth = 3f,
-                cap = StrokeCap.Round
-            )
-
-            // User dot
-            drawCircle(color = ElectricCyan.copy(alpha = 0.30f), radius = 14f, center = userPx)
-            drawCircle(color = ElectricCyan, radius = 6.5f, center = userPx)
-            drawCircle(color = ObsidianBackground, radius = 2.5f, center = userPx)
-
-            // 9. Estimated Target Peak Crosshair Reticle
+            // 8. Estimated Target Peak Crosshair Reticle
             if (hasLockedTarget && gridSnapshot.updateCount > 0L) {
                 val peakPx = worldToPx(
                     gridSnapshot.estimatedTargetX.toDouble(),
@@ -418,6 +376,126 @@ fun RadarCanvas(
                 drawLine(lockColor, Offset(peakPx.x, peakPx.y + 5f), Offset(peakPx.x, peakPx.y + outerR + 6f), 2.2f)
                 drawCircle(color = lockColor, radius = 3f, center = peakPx)
             }
+
+            // 9. TOP Z-LAYER (DRAWN LAST, ABOVE ALL SHAPES & HEATMAPS):
+            //    High-Visibility Player Reticle, 2x Cyan Chevron, Contrast Halo & 35% Dashed Forward Ray
+            val userPx = worldToPx(userPose.xMeters, userPose.yMeters)
+            val theta = userPose.headingRad
+            val fx = cos(theta).toFloat()
+            val fy = (-sin(theta)).toFloat()
+            val rx = sin(theta).toFloat()
+            val ry = cos(theta).toFloat()
+
+            // Translucent forward FOV cone
+            val coneLength = (w * 0.5f) * 0.22f
+            val halfConeRad = Math.toRadians(22.0)
+            val coneTipLeft = Offset(
+                x = userPx.x + (coneLength * cos(theta + halfConeRad)).toFloat(),
+                y = userPx.y - (coneLength * sin(theta + halfConeRad)).toFloat()
+            )
+            val coneTipRight = Offset(
+                x = userPx.x + (coneLength * cos(theta - halfConeRad)).toFloat(),
+                y = userPx.y - (coneLength * sin(theta - halfConeRad)).toFloat()
+            )
+            val conePath = Path().apply {
+                moveTo(userPx.x, userPx.y)
+                lineTo(coneTipLeft.x, coneTipLeft.y)
+                lineTo(coneTipRight.x, coneTipRight.y)
+                close()
+            }
+            drawPath(path = conePath, color = ElectricCyan.copy(alpha = 0.22f))
+
+            // Crisp dashed forward heading ray extending 35% of radar radius with dark contrast halo
+            val rayLength = (w * 0.5f) * 0.35f
+            val rayEnd = Offset(
+                x = userPx.x + fx * rayLength,
+                y = userPx.y + fy * rayLength
+            )
+            val rayDash = PathEffect.dashPathEffect(floatArrayOf(14f, 9f), 0f)
+            drawLine(
+                color = ObsidianBackground.copy(alpha = 0.92f),
+                start = userPx,
+                end = rayEnd,
+                strokeWidth = 7.5f,
+                cap = StrokeCap.Round,
+                pathEffect = rayDash
+            )
+            drawLine(
+                color = ElectricCyan,
+                start = userPx,
+                end = rayEnd,
+                strokeWidth = 3.4f,
+                cap = StrokeCap.Round,
+                pathEffect = rayDash
+            )
+            // Small bright terminal pip at tip of forward ray
+            drawCircle(color = ObsidianBackground.copy(alpha = 0.92f), radius = 6.5f, center = rayEnd)
+            drawCircle(color = ElectricCyan, radius = 3.8f, center = rayEnd)
+
+            // Rear shield null arc (behind user at theta + pi) with contrast halo
+            val screenHeadingDeg = (-Math.toDegrees(theta)).toFloat()
+            val shieldArcRadius = 34f
+            drawArc(
+                color = ObsidianBackground.copy(alpha = 0.90f),
+                startAngle = screenHeadingDeg + 180f - 45f,
+                sweepAngle = 90f,
+                useCenter = false,
+                topLeft = Offset(userPx.x - shieldArcRadius, userPx.y - shieldArcRadius),
+                size = Size(shieldArcRadius * 2f, shieldArcRadius * 2f),
+                style = Stroke(width = 8.0f, cap = StrokeCap.Round)
+            )
+            drawArc(
+                color = ThermalAmber.copy(alpha = 0.95f),
+                startAngle = screenHeadingDeg + 180f - 45f,
+                sweepAngle = 90f,
+                useCenter = false,
+                topLeft = Offset(userPx.x - shieldArcRadius, userPx.y - shieldArcRadius),
+                size = Size(shieldArcRadius * 2f, shieldArcRadius * 2f),
+                style = Stroke(width = 4.0f, cap = StrokeCap.Round)
+            )
+
+            // Dark contrast halo backing circle beneath player chevron
+            drawCircle(
+                color = ObsidianBackground.copy(alpha = 0.88f),
+                radius = 28f,
+                center = userPx
+            )
+            drawCircle(
+                color = ElectricCyan.copy(alpha = 0.35f),
+                radius = 28f,
+                center = userPx,
+                style = Stroke(width = 2.0f)
+            )
+
+            // 2x larger high-contrast directional cyan chevron with dark contrast outline
+            val tip = Offset(userPx.x + fx * 26f, userPx.y + fy * 26f)
+            val leftWing = Offset(userPx.x - fx * 16f - rx * 19f, userPx.y - fy * 16f - ry * 19f)
+            val notch = Offset(userPx.x - fx * 7f, userPx.y - fy * 7f)
+            val rightWing = Offset(userPx.x - fx * 16f + rx * 19f, userPx.y - fy * 16f + ry * 19f)
+
+            val chevronPath = Path().apply {
+                moveTo(tip.x, tip.y)
+                lineTo(rightWing.x, rightWing.y)
+                lineTo(notch.x, notch.y)
+                lineTo(leftWing.x, leftWing.y)
+                close()
+            }
+            // Dark contrast outline halo around chevron
+            drawPath(
+                path = chevronPath,
+                color = ObsidianBackground,
+                style = Stroke(width = 9.0f, join = StrokeJoin.Round, cap = StrokeCap.Round)
+            )
+            // High-contrast filled cyan chevron + bright white-cyan rim
+            drawPath(path = chevronPath, color = ElectricCyan)
+            drawPath(
+                path = chevronPath,
+                color = ReadoutInkPrimary.copy(alpha = 0.92f),
+                style = Stroke(width = 2.2f, join = StrokeJoin.Round, cap = StrokeCap.Round)
+            )
+            // Crisp center anchor pip
+            drawCircle(color = ObsidianBackground, radius = 4.2f, center = userPx)
+            drawCircle(color = ReadoutInkPrimary, radius = 2.2f, center = userPx)
         }
 
         // Cardinal Compass Labels (N / S / E / W)
@@ -472,9 +550,9 @@ fun RadarCanvas(
                 color = ReadoutInkSecondary
             )
             Text(
-                text = "${backgroundEmitters.size} RF",
+                text = if (showBackgroundPins) "${backgroundEmitters.size} RF" else "${backgroundEmitters.size} RF (OFF)",
                 style = MaterialTheme.typography.labelSmall,
-                color = ElectricCyan
+                color = if (showBackgroundPins) ElectricCyan else ReadoutInkMuted
             )
         }
 

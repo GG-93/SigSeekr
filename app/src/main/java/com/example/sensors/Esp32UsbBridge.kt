@@ -67,6 +67,7 @@ class Esp32UsbBridge(
                 null
             } ?: return@flow
 
+            var claimedInterface: android.hardware.usb.UsbInterface? = null
             try {
                 val usbInterface = (0 until device.interfaceCount)
                     .map { device.getInterface(it) }
@@ -79,6 +80,7 @@ class Esp32UsbBridge(
                     } ?: return@flow
 
                 if (!connection.claimInterface(usbInterface, true)) return@flow
+                claimedInterface = usbInterface
                 val bulkIn = (0 until usbInterface.endpointCount)
                     .map { usbInterface.getEndpoint(it) }
                     .first { ep ->
@@ -110,6 +112,7 @@ class Esp32UsbBridge(
                 // Fail silently on disconnect or I/O error
             } finally {
                 try {
+                    claimedInterface?.let { connection.releaseInterface(it) }
                     connection.close()
                 } catch (_: Exception) {
                     // Ignore close error
