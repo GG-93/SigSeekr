@@ -32,19 +32,17 @@ data class SweepCoachState(
  * Guided Two-Spin Baseline Triangulation Coach for the single active locked target.
  *
  * Stages:
- * 1. SPIN_1: Sweep >= 270° (27 of 36 ten-degree heading bins) at Anchor A while recording peak RSSI bearing.
+ * 1. SPIN_1: Sweep >= 350° signed net yaw at Anchor A while recording peak RSSI bearing.
  * 2. WALK_PERPENDICULAR: Walk 5.0m perpendicular (±90°) from Anchor A peak bearing to establish baseline Anchor B.
- * 3. SPIN_2: Sweep >= 270° at Anchor B to resolve range/bearing ambiguity via cross-baseline triangulation.
+ * 3. SPIN_2: Sweep >= 350° signed net yaw at Anchor B (optional if CEP95 <= 1.5m already locks).
  * 4. LOCKED: Converged when Bayesian grid CEP95 <= 1.5m.
  */
 class SweepCoachEngine {
 
     companion object {
-        const val REQUIRED_SPIN_DEGREES = 270
+        const val REQUIRED_SPIN_DEGREES = 350
         const val REQUIRED_PERPENDICULAR_WALK_M = 5.0f
         const val LOCKED_CEP95_THRESHOLD_M = 1.5f
-        private const val HEADING_BIN_COUNT = 36 // 10° per bin
-        private const val REQUIRED_BINS = 27     // 27 * 10° = 270°
         private const val MIN_UPDATES_FOR_LOCK = 6L
     }
 
@@ -52,7 +50,8 @@ class SweepCoachEngine {
     private var stage: SweepStage = SweepStage.IDLE
     private var anchorA: Point2D? = null
     private var anchorB: Point2D? = null
-    private val coveredBins = BooleanArray(HEADING_BIN_COUNT)
+    private var lastHeadingRad: Double? = null
+    private var cumulativeSignedYawDeg: Double = 0.0
     private var bestSpin1RssiDbm: Int = Int.MIN_VALUE
     private var anchorAPeakBearingRad: Double? = null
     private var lastCep95Meters: Float = 25.0f
@@ -62,7 +61,8 @@ class SweepCoachEngine {
             stage = SweepStage.IDLE
             anchorA = null
             anchorB = null
-            coveredBins.fill(false)
+            lastHeadingRad = null
+            cumulativeSignedYawDeg = 0.0
             bestSpin1RssiDbm = Int.MIN_VALUE
             anchorAPeakBearingRad = null
             lastCep95Meters = 25.0f
@@ -74,11 +74,11 @@ class SweepCoachEngine {
             stage = SweepStage.SPIN_1
             anchorA = Point2D(userPose.xMeters, userPose.yMeters)
             anchorB = null
-            coveredBins.fill(false)
+            lastHeadingRad = userPose.headingRad
+            cumulativeSignedYawDeg = 0.0
             bestSpin1RssiDbm = Int.MIN_VALUE
             anchorAPeakBearingRad = userPose.headingRad
             lastCep95Meters = 25.0f
-            markHeadingBinLocked(userPose.headingRad)
             return buildStateLocked(userPose)
         }
     }
@@ -108,12 +108,12 @@ class SweepCoachEngine {
                     if (anchorA == null) {
                         anchorA = Point2D(userPose.xMeters, userPose.yMeters)
                     }
-                    markHeadingBinLocked(userPose.headingRad)
+                    integrateSignedYawLocked(userPose.headingRad)
                     if (lockedTargetRssiDbm != null && lockedTargetRssiDbm >= bestSpin1RssiDbm) {
                         bestSpin1RssiDbm = lockedTargetRssiDbm
                         anchorAPeakBearingRad = userPose.headingRad
                     }
-                    if (countCoveredBinsLocked() >= REQUIRED_BINS) {
+                    if (kotlin.math.abs(cumulativeSignedYawDeg) >= REQUIRED_SPIN_DEGREES.toDouble()) {
                         stage = SweepStage.WALK_PERPENDICULAR
                     }
                 }
@@ -123,8 +123,8 @@ class SweepCoachEngine {
                     val walked = hypot(userPose.xMeters - a.x, userPose.yMeters - a.y).toFloat()
                     if (walked >= REQUIRED_PERPENDICULAR_WALK_M) {
                         anchorB = Point2D(userPose.xMeters, userPose.yMeters)
-                        coveredBins.fill(false)
-                        markHeadingBinLocked(userPose.headingRad)
+                        lastHeadingRad = userPose.headingRad
+                        cumulativeSignedYawDeg = 0.0
                         stage = SweepStage.SPIN_2
                     }
                 }
@@ -133,8 +133,8 @@ class SweepCoachEngine {
                     if (anchorB == null) {
                         anchorB = Point2D(userPose.xMeters, userPose.yMeters)
                     }
-                    markHeadingBinLocked(userPose.headingRad)
-                    if (countCoveredBinsLocked() >= REQUIRED_BINS &&
+                    integrateSignedYawLocked(userPose.headingRad)
+                    if (kotlin.math.abs(cumulativeSignedYawDeg) >= REQUIRED_SPIN_DEGREES.toDouble() &&
                         gridSnapshot.cep95Meters <= LOCKED_CEP95_THRESHOLD_M
                     ) {
                         stage = SweepStage.LOCKED
@@ -156,22 +156,17 @@ class SweepCoachEngine {
         buildStateLocked(userPose)
     }
 
-    private fun markHeadingBinLocked(headingRad: Double) {
-        val deg = ((Math.toDegrees(AngleMath.wrapAngle(headingRad)) % 360.0) + 360.0) % 360.0
-        val bin = ((deg / 10.0).toInt()).coerceIn(0, HEADING_BIN_COUNT - 1)
-        coveredBins[bin] = true
-    }
-
-    private fun countCoveredBinsLocked(): Int {
-        var count = 0
-        for (covered in coveredBins) {
-            if (covered) count++
+    private fun integrateSignedYawLocked(headingRad: Double) {
+        val prev = lastHeadingRad
+        if (prev != null) {
+            val deltaRad = AngleMath.wrapAngle(headingRad - prev)
+            cumulativeSignedYawDeg += Math.toDegrees(deltaRad)
         }
-        return count
+        lastHeadingRad = headingRad
     }
 
     private fun buildStateLocked(userPose: UserPose): SweepCoachState {
-        val spinDeg = (countCoveredBinsLocked() * 10).coerceAtMost(360)
+        val spinDeg = kotlin.math.abs(cumulativeSignedYawDeg).toInt().coerceIn(0, 360)
         val a = anchorA
         val walked = if (a != null) {
             hypot(userPose.xMeters - a.x, userPose.yMeters - a.y).toFloat()
@@ -186,14 +181,14 @@ class SweepCoachEngine {
             SweepStage.IDLE -> 0.0f to "Select a target from Scanner to start 2-spin triangulation"
             SweepStage.SPIN_1 -> {
                 val p = (spinDeg.toFloat() / REQUIRED_SPIN_DEGREES).coerceIn(0f, 1f)
-                p to "Spin slowly at Anchor A ($spinDeg° / 270°) to map shield null"
+                p to "Spin slowly at Anchor A ($spinDeg° / 360°) · target 350°"
             }
             SweepStage.WALK_PERPENDICULAR -> {
                 val p = (walked / REQUIRED_PERPENDICULAR_WALK_M).coerceIn(0f, 1f)
                 val remaining = (REQUIRED_PERPENDICULAR_WALK_M - walked).coerceAtLeast(0f)
                 p to String.format(
                     java.util.Locale.US,
-                    "Walk %.1fm perpendicular (±90°) to peak bearing to Anchor B",
+                    "Walk %.1fm perpendicular (±90°) to Anchor B (Spin 2 optional if CEP95 ≤ 1.5m)",
                     remaining
                 )
             }
@@ -206,7 +201,7 @@ class SweepCoachEngine {
                         lastCep95Meters
                     )
                 } else {
-                    p to "Spin slowly at Anchor B ($spinDeg° / 270°) to triangulate"
+                    p to "Spin at Anchor B ($spinDeg° / 360°) · optional if CEP95 ≤ 1.5m locks"
                 }
             }
             SweepStage.LOCKED -> {

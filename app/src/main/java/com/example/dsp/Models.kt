@@ -104,7 +104,10 @@ data class UserPose(
  */
 data class MagneticFieldStatus(
     val fluxMicroTesla: Float = 45.0f,
+    val baselineFluxMicroTesla: Float? = null,
+    val driftDeltaMicroTesla: Float = 0f,
     val isMagneticWarped: Boolean = false,
+    val needsFigure8Calibration: Boolean = false,
     val hasSensorReading: Boolean = false
 )
 
@@ -132,7 +135,16 @@ data class RfMeasurement(
     val scanResult: ScanResult? = null,
     val fingerprintHash: String = macAddress,
     val bleAddressType: Int? = null,
-    val bleDecoded: BleDecodedPacket? = null
+    val bleDecoded: BleDecodedPacket? = null,
+    val wifiCapabilities: String? = null,
+    val wifiVendorOuiHexes: List<String> = emptyList(),
+    val frequencyMhz: Int? = null,
+    val channelNumber: Int? = null,
+    val channelWidthMhz: Int? = null,
+    val wifiStandardLabel: String? = null,
+    val wifiIeTags: List<Int> = emptyList(),
+    val wifiVendorOuis: List<Pair<String, String>> = emptyList(),
+    val wpsDeviceInfo: String? = null
 )
 
 data class DiscoveredEmitter(
@@ -147,10 +159,18 @@ data class DiscoveredEmitter(
     val fingerprintHash: String = macAddress,
     val kalmanRssiDbm: Float = rssiDbm.toFloat().coerceIn(-127.0f, -1.0f),
     val bleDecoded: BleDecodedPacket? = null,
-    val observedMacCount: Int = 1
+    val observedMacCount: Int = 1,
+    val linkedMacs: List<String> = listOf(macAddress),
+    val wifiCapabilities: String? = null,
+    val droneProtocol: String? = null,
+    val isDroneSuspect: Boolean = false,
+    val isEvilTwinSuspect: Boolean = false,
+    val evilTwinReason: String? = null,
+    val isWatchlistMatch: Boolean = false,
+    val isMuted: Boolean = false
 ) {
     val isMacRotated: Boolean
-        get() = observedMacCount > 1 || fingerprintHash.startsWith("BLE_FP:")
+        get() = observedMacCount > 1 || linkedMacs.size > 1
 }
 
 data class BackgroundEmitter(
@@ -170,7 +190,8 @@ data class BackgroundEmitter(
     val shapeStage: EmitterShapeStage,
     val isSavedInLog: Boolean,
     val trackerTag: BleTrackerTag? = null,
-    val lastSeenElapsedMs: Long
+    val lastSeenElapsedMs: Long,
+    val baselineMeters: Float = 0.0f
 )
 
 data class EmitterDossierData(
@@ -182,6 +203,7 @@ data class EmitterDossierData(
     val latestRawRssiDbm: Int,
     val latestKalmanRssiDbm: Float,
     val packetRateHz: Float,
+    val meanDeltaMs: Float = 0.0f,
     val interArrivalJitterMs: Float,
     val clockSkewPpm: Float,
     val rssiHistory: List<RssiSamplePoint>,
@@ -192,7 +214,31 @@ data class EmitterDossierData(
     val estimatedDistanceMeters: Float?,
     val isPinned: Boolean,
     val isLocked: Boolean,
-    val scanResult: ScanResult?
+    val scanResult: ScanResult?,
+    val displayFingerprintId: String = DeviceFingerprintEngine.displayFingerprintId(fingerprintHash),
+    val primaryVendorLabel: String? = null,
+    val bearingDegTrue: Int? = null,
+    val bearingConfidencePct: Int = 0,
+    val localizationModeLabel: String = "Omni SAR",
+    val baselineMeters: Float = 0.0f,
+    val enuEastMeters: Float = 0.0f,
+    val enuNorthMeters: Float = 0.0f,
+    val wgs84Lat: Double? = null,
+    val wgs84Lon: Double? = null,
+    val isInsidePerimeter: Boolean? = null,
+    val activeGeofenceCount: Int = 0,
+    val protocolProfile: String = "",
+    val frequencyChannelLabel: String = "",
+    val capabilitiesSummary: String = "",
+    val wifiIeTags: List<Int> = emptyList(),
+    val wifiVendorOuis: List<Pair<String, String>> = emptyList(),
+    val wpsDeviceInfo: String? = null,
+    val tailChaseScore: Int = 0,
+    val firstSeenEpochMs: Long = 0L,
+    val lastSeenEpochMs: Long = 0L,
+    val isWatched: Boolean = false,
+    val isMuted: Boolean = false,
+    val totalPacketCount: Int = 0
 )
 
 data class GridSnapshot(
@@ -206,7 +252,9 @@ data class GridSnapshot(
     val cep95Meters: Float,
     val peakConfidencePct: Int,
     val updateCount: Long,
-    val activeTier: LocalizationTier
+    val activeTier: LocalizationTier,
+    val gridOriginX: Float = 0.0f,
+    val gridOriginY: Float = 0.0f
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -218,7 +266,9 @@ data class GridSnapshot(
             estimatedTargetY == other.estimatedTargetY &&
             estimatedDistanceMeters == other.estimatedDistanceMeters &&
             cep95Meters == other.cep95Meters &&
-            peakConfidencePct == other.peakConfidencePct
+            peakConfidencePct == other.peakConfidencePct &&
+            gridOriginX == other.gridOriginX &&
+            gridOriginY == other.gridOriginY
     }
 
     override fun hashCode(): Int {
@@ -230,6 +280,8 @@ data class GridSnapshot(
         result = 31 * result + estimatedDistanceMeters.hashCode()
         result = 31 * result + cep95Meters.hashCode()
         result = 31 * result + peakConfidencePct
+        result = 31 * result + gridOriginX.hashCode()
+        result = 31 * result + gridOriginY.hashCode()
         return result
     }
 
@@ -271,4 +323,40 @@ data class SessionSnapshotRecord(
     val minDistanceMeters: Double,
     val maxRssiDbm: Int,
     val localizationTier: String
+)
+
+enum class WatchlistMatchType(val label: String) {
+    OUI("OUI Prefix"),
+    SUBSTRING("SSID / Name"),
+    FINGERPRINT("Fingerprint")
+}
+
+data class WatchlistEntry(
+    val id: Long = 0L,
+    val matchType: WatchlistMatchType,
+    val pattern: String,
+    val label: String,
+    val createdAtMs: Long = System.currentTimeMillis()
+)
+
+enum class PerimeterTriggerMode(val label: String) {
+    ENTER("Enter"),
+    LEAVE("Leave"),
+    BOTH("Both")
+}
+
+enum class PerimeterScope(val label: String) {
+    ALL_UNKNOWN("All Unknown"),
+    WATCHLIST_ONLY("Watchlist Only"),
+    LOCKED_TARGET("Locked Target")
+}
+
+data class PerimeterEventRecord(
+    val id: Long = 0L,
+    val timestampEpochMs: Long,
+    val emitterKey: String,
+    val emitterName: String,
+    val eventType: String, // "ENTER" or "LEAVE"
+    val distanceMeters: Double,
+    val rssiDbm: Int
 )

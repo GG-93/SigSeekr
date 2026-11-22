@@ -28,7 +28,7 @@ class BackgroundEmitterTracker {
         private const val STRONG_SIGHTING_MARGIN_DB = 6
         private const val MAX_SIGHTINGS_PER_EMITTER = 64
         private const val MIN_EST_DISTANCE_M = 0.5
-        private const val MAX_EST_DISTANCE_M = 35.0
+        private const val MAX_EST_DISTANCE_M = 250.0
         private const val EXPIRY_MS = 45_000L
         const val MIN_HEADING_SPAN_FOR_BEARING_DEG = 180.0f
         const val MIN_RSSI_CONTRAST_DB = 4
@@ -397,10 +397,8 @@ class BackgroundEmitterTracker {
                     )
                 }
 
-                val estX = (anchorX + estDist * cos(meanBearing))
-                    .coerceIn(0.5, BayesianGridFilter.ARENA_SIZE_METERS - 0.5)
-                val estY = (anchorY + estDist * sin(meanBearing))
-                    .coerceIn(0.5, BayesianGridFilter.ARENA_SIZE_METERS - 0.5)
+                val estX = anchorX + estDist * cos(meanBearing)
+                val estY = anchorY + estDist * sin(meanBearing)
 
                 result.add(
                     BackgroundEmitter(
@@ -420,7 +418,8 @@ class BackgroundEmitterTracker {
                         shapeStage = stage,
                         isSavedInLog = isPinnedByLog,
                         trackerTag = entry.trackerTag,
-                        lastSeenElapsedMs = entry.lastSeenElapsedMs
+                        lastSeenElapsedMs = entry.lastSeenElapsedMs,
+                        baselineMeters = walkedBaselineMeters.toFloat()
                     )
                 )
             }

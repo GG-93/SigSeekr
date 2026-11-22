@@ -36,14 +36,39 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         const val START_Y_METERS = 25.0
         const val MIN_NOMINAL_FLUX_UT = 25.0f
         const val MAX_NOMINAL_FLUX_UT = 70.0f
+        const val MAGNETIC_DRIFT_THRESHOLD_UT = 6.0f
         private const val MAX_TRAIL_POINTS = 500
 
-        fun computeMagneticStatus(bx: Float, by: Float, bz: Float): MagneticFieldStatus {
+        fun computeMagneticStatus(
+            bx: Float,
+            by: Float,
+            bz: Float,
+            baselineUt: Float? = null,
+            needsFigure8: Boolean = false
+        ): MagneticFieldStatus {
             val flux = sqrt(bx * bx + by * by + bz * bz)
-            val warped = !flux.isFinite() || flux < MIN_NOMINAL_FLUX_UT || flux > MAX_NOMINAL_FLUX_UT
+            if (!flux.isFinite()) {
+                return MagneticFieldStatus(
+                    fluxMicroTesla = 0f,
+                    baselineFluxMicroTesla = baselineUt,
+                    driftDeltaMicroTesla = 0f,
+                    isMagneticWarped = true,
+                    needsFigure8Calibration = needsFigure8,
+                    hasSensorReading = true
+                )
+            }
+            val driftDelta = if (baselineUt != null) kotlin.math.abs(flux - baselineUt) else 0f
+            val warped = if (baselineUt != null) {
+                driftDelta > MAGNETIC_DRIFT_THRESHOLD_UT
+            } else {
+                flux < MIN_NOMINAL_FLUX_UT || flux > MAX_NOMINAL_FLUX_UT
+            }
             return MagneticFieldStatus(
-                fluxMicroTesla = if (flux.isFinite()) flux else 0f,
+                fluxMicroTesla = flux,
+                baselineFluxMicroTesla = baselineUt,
+                driftDeltaMicroTesla = driftDelta,
                 isMagneticWarped = warped,
+                needsFigure8Calibration = needsFigure8,
                 hasSensorReading = true
             )
         }
@@ -60,6 +85,8 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val magnetSensor: Sensor? =
         sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+    private val gyroSensor: Sensor? =
+        sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
     private val stepDetectorSensor: Sensor? =
         sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
@@ -75,13 +102,18 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
 
     private val lock = Any()
     private val rotationMatrix = FloatArray(9)
-    private val lastRotationMatrix = FloatArray(9)
+    private val lastRotationMatrix = FloatArray(9).apply {
+        this[0] = 1f; this[4] = 1f; this[8] = 1f
+    }
     private val lastAccel = FloatArray(3)
     private val lastMagnet = FloatArray(3)
     private var hasRotationMatrix = false
     private var hasAccel = false
     private var hasMagnet = false
     private var smoothedFluxUt: Float? = null
+    private var baselineFluxUt: Float? = null
+    private var needsFigure8Calibration: Boolean = false
+    private var lastGyroTimestampNs: Long = 0L
 
     @Volatile
     private var stepLengthMeters: Double = 0.72
@@ -126,6 +158,15 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                     this,
                     magnetSensor,
                     SensorManager.SENSOR_DELAY_UI
+                )
+            }
+
+            if (gyroSensor != null) {
+                lastGyroTimestampNs = 0L
+                sensorManager.registerListener(
+                    this,
+                    gyroSensor,
+                    SensorManager.SENSOR_DELAY_GAME
                 )
             }
 
@@ -176,6 +217,21 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         }
     }
 
+    /** Captures current ambient magnetic flux B_base (uT) as the clean local baseline. */
+    fun snapshotMagneticBaseline() {
+        synchronized(lock) {
+            val currentFlux = smoothedFluxUt
+            if (currentFlux != null && currentFlux.isFinite()) {
+                baselineFluxUt = currentFlux
+                _magneticStatus.value = _magneticStatus.value.copy(
+                    baselineFluxMicroTesla = currentFlux,
+                    driftDeltaMicroTesla = 0f,
+                    isMagneticWarped = false
+                )
+            }
+        }
+    }
+
     /** Captures current raw azimuth as compass offset so physical facing aligns to Grid North (0 deg). */
     fun zeroHeading() {
         synchronized(lock) {
@@ -186,6 +242,7 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                 headingOffsetRad = newOffset,
                 headingRad = newTheta
             )
+            snapshotMagneticBaseline()
         }
     }
 
@@ -214,6 +271,16 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         }
     }
 
+    /** Clears stray breadcrumb trail while preserving current user coordinates. */
+    fun clearTrail() {
+        synchronized(lock) {
+            val current = _pose.value
+            _pose.value = current.copy(
+                trail = listOf(Point2D(current.xMeters, current.yMeters))
+            )
+        }
+    }
+
     /**
      * Triggers a single dead-reckoning step using the exact Cartesian step equation.
      * Called automatically on TYPE_STEP_DETECTOR events.
@@ -222,8 +289,8 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         synchronized(lock) {
             val current = _pose.value
             val (dx, dy) = AngleMath.stepDisplacement(current.headingRad, stepLengthMeters)
-            val nextX = (current.xMeters + dx).coerceIn(0.0, BayesianGridFilter.ARENA_SIZE_METERS)
-            val nextY = (current.yMeters + dy).coerceIn(0.0, BayesianGridFilter.ARENA_SIZE_METERS)
+            val nextX = current.xMeters + dx
+            val nextY = current.yMeters + dy
             val updatedTrail = ArrayList<Point2D>(
                 (current.trail.size + 1).coerceAtMost(MAX_TRAIL_POINTS)
             ).apply {
@@ -278,9 +345,19 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                     val prev = smoothedFluxUt
                     val filtered = if (prev == null) rawFlux else (prev * 0.75f + rawFlux * 0.25f)
                     smoothedFluxUt = filtered
+                    val base = baselineFluxUt
+                    val driftDelta = if (base != null) kotlin.math.abs(filtered - base) else 0f
+                    val warped = if (base != null) {
+                        driftDelta > MAGNETIC_DRIFT_THRESHOLD_UT
+                    } else {
+                        filtered < MIN_NOMINAL_FLUX_UT || filtered > MAX_NOMINAL_FLUX_UT
+                    }
                     _magneticStatus.value = MagneticFieldStatus(
                         fluxMicroTesla = filtered,
-                        isMagneticWarped = filtered < MIN_NOMINAL_FLUX_UT || filtered > MAX_NOMINAL_FLUX_UT,
+                        baselineFluxMicroTesla = base,
+                        driftDeltaMicroTesla = driftDelta,
+                        isMagneticWarped = warped,
+                        needsFigure8Calibration = needsFigure8Calibration,
                         hasSensorReading = true
                     )
                 }
@@ -292,6 +369,35 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                         updateOrientationFromMatrixLocked(rotationMatrix)
                     }
                 }
+            }
+
+            Sensor.TYPE_GYROSCOPE -> {
+                val ts = event.timestamp
+                if (lastGyroTimestampNs != 0L && ts > lastGyroTimestampNs) {
+                    val dtSec = (ts - lastGyroTimestampNs) * 1e-9
+                    if (dtSec in 0.0..0.25) {
+                        synchronized(lock) {
+                            if (_magneticStatus.value.isMagneticWarped) {
+                                val worldYawRate = AngleMath.computeWorldVerticalYawRate(
+                                    wxRadPerSec = event.values[0],
+                                    wyRadPerSec = event.values[1],
+                                    wzRadPerSec = event.values[2],
+                                    rotationMatrix = lastRotationMatrix
+                                )
+                                val dTheta = worldYawRate * dtSec
+                                val current = _pose.value
+                                val nextTheta = AngleMath.wrapAngle(current.headingRad + dTheta)
+                                val nextRawAzimuth = AngleMath.wrapAngle(current.rawAzimuthRad - dTheta)
+                                _pose.value = current.copy(
+                                    headingRad = nextTheta,
+                                    rawAzimuthRad = nextRawAzimuth,
+                                    hasOrientationReading = true
+                                )
+                            }
+                        }
+                    }
+                }
+                lastGyroTimestampNs = ts
             }
 
             Sensor.TYPE_STEP_DETECTOR -> {
@@ -309,6 +415,18 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
         )
         if (!orient.azimuthRad.isFinite()) return
         val current = _pose.value
+        if (_magneticStatus.value.isMagneticWarped) {
+            // Coast on pure tilt-compensated gyroscope yaw while magnetically drifted,
+            // updating only pitch/roll/tilt-guard so steel rebar cannot twist the arrow.
+            _pose.value = current.copy(
+                pitchDeg = orient.pitchDeg,
+                rollDeg = orient.rollDeg,
+                isShieldTiltGuarded = orient.isTiltGuardTriggered,
+                screenOutwardMode = screenOutwardMode,
+                hasOrientationReading = true
+            )
+            return
+        }
         val theta = AngleMath.azimuthToCartesianHeading(
             azimuthPsiRad = orient.azimuthRad,
             headingOffsetRad = current.headingOffsetRad
@@ -325,6 +443,15 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        // Handled continuously via total magnetic flux monitor and manual Zero Heading
+        if (sensor?.type == Sensor.TYPE_MAGNETIC_FIELD || sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
+            val lowAcc = accuracy == SensorManager.SENSOR_STATUS_UNRELIABLE ||
+                accuracy == SensorManager.SENSOR_STATUS_ACCURACY_LOW
+            synchronized(lock) {
+                needsFigure8Calibration = lowAcc
+                _magneticStatus.value = _magneticStatus.value.copy(
+                    needsFigure8Calibration = lowAcc
+                )
+            }
+        }
     }
 }

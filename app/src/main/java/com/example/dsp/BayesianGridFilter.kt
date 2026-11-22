@@ -50,10 +50,20 @@ class BayesianGridFilter {
 
     private var updateCount: Long = 0L
     private var activeTier: LocalizationTier = LocalizationTier.NONE
+    private var gridOriginX: Double = 0.0
+    private var gridOriginY: Double = 0.0
 
-    /** Resets all 10,000 cells back to uniform probability 1/10000. */
-    fun resetToUniform() {
+    /**
+     * Resets all 10,000 cells back to uniform probability 1/10000 and optionally
+     * re-anchors the 50m x 50m grid around `(centerX, centerY)` in world coordinates.
+     */
+    fun resetToUniform(
+        centerX: Double = ARENA_SIZE_METERS * 0.5,
+        centerY: Double = ARENA_SIZE_METERS * 0.5
+    ) {
         synchronized(lock) {
+            gridOriginX = centerX - ARENA_SIZE_METERS * 0.5
+            gridOriginY = centerY - ARENA_SIZE_METERS * 0.5
             frontBuffer.fill(UNIFORM_PROB)
             backBuffer.fill(UNIFORM_PROB)
             updateCount = 0L
@@ -81,11 +91,11 @@ class BayesianGridFilter {
             var totalWeight = 0.0
 
             for (yIdx in 0 until GRID_SIZE) {
-                val dy = cellCenterY[yIdx] - userY
+                val dy = (gridOriginY + cellCenterY[yIdx]) - userY
                 val dySq = dy * dy
                 val rowOffset = yIdx * GRID_SIZE
                 for (xIdx in 0 until GRID_SIZE) {
-                    val dx = cellCenterX[xIdx] - userX
+                    val dx = (gridOriginX + cellCenterX[xIdx]) - userX
                     val dCell = sqrt(dx * dx + dySq)
                     val diff = rttDistanceMeters - dCell
                     val likelihood = exp(-(diff * diff) / twoSigmaSq)
@@ -134,11 +144,11 @@ class BayesianGridFilter {
             var totalWeight = 0.0
 
             for (yIdx in 0 until GRID_SIZE) {
-                val dy = cellCenterY[yIdx] - userY
+                val dy = (gridOriginY + cellCenterY[yIdx]) - userY
                 val dySq = dy * dy
                 val rowOffset = yIdx * GRID_SIZE
                 for (xIdx in 0 until GRID_SIZE) {
-                    val dx = cellCenterX[xIdx] - userX
+                    val dx = (gridOriginX + cellCenterX[xIdx]) - userX
                     val dCell = sqrt(dx * dx + dySq)
                     val clampedDist = max(dCell, MIN_DISTANCE_METERS)
 
@@ -220,11 +230,11 @@ class BayesianGridFilter {
 
             for (yIdx in yMin..yMax) {
                 val rowOffset = yIdx * GRID_SIZE
-                val cy = cellCenterY[yIdx]
+                val cy = gridOriginY + cellCenterY[yIdx]
                 for (xIdx in xMin..xMax) {
                     val w = frontBuffer[rowOffset + xIdx]
                     localWeightSum += w
-                    weightedX += w * cellCenterX[xIdx]
+                    weightedX += w * (gridOriginX + cellCenterX[xIdx])
                     weightedY += w * cy
                 }
             }
@@ -263,7 +273,9 @@ class BayesianGridFilter {
                 cep95Meters = cep95.toFloat(),
                 peakConfidencePct = normalizedConfidence,
                 updateCount = updateCount,
-                activeTier = activeTier
+                activeTier = activeTier,
+                gridOriginX = gridOriginX.toFloat(),
+                gridOriginY = gridOriginY.toFloat()
             )
         }
     }
@@ -275,13 +287,13 @@ class BayesianGridFilter {
     private fun computeCep95Locked(estX: Double, estY: Double): Double {
         radialMassHistogram.fill(0.0)
         for (yIdx in 0 until GRID_SIZE) {
-            val dy = cellCenterY[yIdx] - estY
+            val dy = (gridOriginY + cellCenterY[yIdx]) - estY
             val dySq = dy * dy
             val rowOffset = yIdx * GRID_SIZE
             for (xIdx in 0 until GRID_SIZE) {
                 val p = frontBuffer[rowOffset + xIdx]
                 if (p <= 1e-12) continue
-                val dx = cellCenterX[xIdx] - estX
+                val dx = (gridOriginX + cellCenterX[xIdx]) - estX
                 val dist = sqrt(dx * dx + dySq)
                 val bin = (dist / CEP_BIN_WIDTH_M).toInt().coerceIn(0, CEP_HISTOGRAM_BINS - 1)
                 radialMassHistogram[bin] += p

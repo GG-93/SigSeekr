@@ -32,16 +32,23 @@ object DeviceFingerprintEngine {
         decoded: BleDecodedPacket
     ): String {
         val cleanMac = macAddress.trim().uppercase(Locale.US)
-        if (!isRandomizedBleMac(cleanMac, addressType)) {
+        val hasRandomizedMac = isRandomizedBleMac(cleanMac, addressType)
+        if (!hasRandomizedMac) {
             return "BLE_MAC:$cleanMac"
         }
 
-        val hasSignatureContent = decoded.companyId != null ||
-            decoded.serviceUuids.isNotEmpty() ||
+        // Prevent barebones generic BLE beacons from collapsing together:
+        // Require non-trivial payload entropy (>= 6 payload bytes beyond AD flags 0x01).
+        val nonFlagsAdCount = decoded.adTypes.count { it != 0x01 }
+        val rawByteCount = decoded.rawHexDump.replace(" ", "").length / 2
+        val approxNonFlagsBytes = if (0x01 in decoded.adTypes) (rawByteCount - 3).coerceAtLeast(0) else rawByteCount
+        val hasHighEntropyPayload = nonFlagsAdCount > 0 && approxNonFlagsBytes >= 6 && (
             decoded.staticManufacturerHeaderHex != null ||
-            decoded.adTypes.isNotEmpty()
+                decoded.serviceUuids.isNotEmpty() ||
+                !decoded.localName.isNullOrBlank()
+            )
 
-        if (!hasSignatureContent) {
+        if (!hasHighEntropyPayload) {
             return "BLE_MAC:$cleanMac"
         }
 
@@ -90,5 +97,17 @@ object DeviceFingerprintEngine {
         // combined with RPA (01) / NRPA (00) classification.
         val isLocallyAdministered = (msb and 0x02) != 0
         return isLocallyAdministered && (topTwoBits == 0x40 || topTwoBits == 0x00)
+    }
+
+    /** Formats any internal fingerprintHash or MAC into a compact `FP-XXXXXXXX` SIGINT pill ID. */
+    fun displayFingerprintId(fingerprintHash: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(fingerprintHash.toByteArray(StandardCharsets.UTF_8))
+        return buildString(11) {
+            append("FP-")
+            for (i in 0 until 4) {
+                append(String.format(Locale.US, "%02X", digest[i].toInt() and 0xFF))
+            }
+        }
     }
 }

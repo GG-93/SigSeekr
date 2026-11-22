@@ -88,7 +88,54 @@ class CellularMonitor(
         const val LTE_TA_METERS_PER_UNIT = 78.12f
         // 3GPP TS 45.010 GSM Timing Advance step ≈ 553.8 meters per unit
         const val GSM_TA_METERS_PER_UNIT = 553.8f
+        const val TOWER_CACHE_TTL_MS = 35_000L
         private const val POLL_INTERVAL_MS = 4_000L
+
+        data class CellTowerKey(
+            val generation: CellRadioGeneration,
+            val pci: Int?,
+            val arfcn: Int?
+        )
+
+        data class CachedCellTower(
+            val tower: CellTowerInfo,
+            val lastSeenElapsedMs: Long
+        )
+
+        /**
+         * Merges fresh baseband cell reports into a 35-second rolling cache keyed by
+         * `(rat, pci, arfcn)` so partial Serving-only sweeps never drop neighbor towers.
+         */
+        fun mergeCellTowerCache(
+            cache: MutableMap<CellTowerKey, CachedCellTower>,
+            freshTowers: List<CellTowerInfo>,
+            nowElapsedMs: Long
+        ): List<CellTowerInfo> {
+            if (freshTowers.any { it.isServing }) {
+                for ((key, cached) in cache) {
+                    if (cached.tower.isServing) {
+                        cache[key] = cached.copy(tower = cached.tower.copy(isServing = false))
+                    }
+                }
+            }
+            for (tower in freshTowers) {
+                val key = CellTowerKey(tower.generation, tower.pci, tower.arfcn)
+                cache[key] = CachedCellTower(tower = tower, lastSeenElapsedMs = nowElapsedMs)
+            }
+            val iter = cache.entries.iterator()
+            while (iter.hasNext()) {
+                val entry = iter.next()
+                if ((nowElapsedMs - entry.value.lastSeenElapsedMs) > TOWER_CACHE_TTL_MS) {
+                    iter.remove()
+                }
+            }
+            return cache.values
+                .map { it.tower }
+                .sortedWith(
+                    compareByDescending<CellTowerInfo> { it.isServing }
+                        .thenByDescending { it.rsrpDbm ?: Int.MIN_VALUE }
+                )
+        }
 
         private val CARRIER_PLMN_MAP = mapOf(
             // Canada (MCC 302)
@@ -260,6 +307,8 @@ class CellularMonitor(
     private val telephonyManager =
         appContext.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
     private val cellExecutor = Executors.newSingleThreadExecutor()
+    private val towerCacheLock = Any()
+    private val towerCache = LinkedHashMap<CellTowerKey, CachedCellTower>()
 
     private val _snapshot = MutableStateFlow(CellularSnapshot())
     val snapshot: StateFlow<CellularSnapshot> = _snapshot.asStateFlow()
@@ -316,11 +365,11 @@ class CellularMonitor(
         }
 
         val rawCells: List<CellInfo> = fetchCellInfoSafely(tm)
-        val parsed = rawCells.mapNotNull { parseCellInfo(it) }
-            .sortedWith(
-                compareByDescending<CellTowerInfo> { it.isServing }
-                    .thenByDescending { it.rsrpDbm ?: Int.MIN_VALUE }
-            )
+        val freshParsed = rawCells.mapNotNull { parseCellInfo(it) }
+        val nowElapsed = android.os.SystemClock.elapsedRealtime()
+        val parsed = synchronized(towerCacheLock) {
+            mergeCellTowerCache(towerCache, freshParsed, nowElapsed)
+        }
 
         val serving = parsed.firstOrNull { it.isServing }
         if (serving?.generation == CellRadioGeneration.NR_5G ||
