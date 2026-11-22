@@ -20,6 +20,8 @@ import android.net.wifi.rtt.WifiRttManager
 import android.os.Build
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import com.example.dsp.BleAdDecoder
+import com.example.dsp.DeviceFingerprintEngine
 import com.example.dsp.EmitterTransport
 import com.example.dsp.RfMeasurement
 import kotlinx.coroutines.CoroutineScope
@@ -53,7 +55,8 @@ val ScanResult.isWifiRttResponder: Boolean
 /**
  * 100% standalone RF telemetry source powered strictly by the phone's internal
  * Wi-Fi radio, WifiRttManager (API 28+), and BluetoothLeScanner.
- * Zero external hardware or internet connectivity required.
+ * Enriches every packet with verbose [BleAdDecoder] parsing and
+ * [DeviceFingerprintEngine] MAC-randomization fingerprinting.
  */
 class StandaloneRadioDataSource(
     private val context: Context
@@ -132,8 +135,19 @@ class StandaloneRadioDataSource(
 
             private fun emitBleResult(result: BleScanResult) {
                 val mac = result.device?.address?.uppercase() ?: return
-                val advertisedName = result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
-                val deviceName = advertisedName ?: readBleDeviceNameSafely(result) ?: "BLE Emitter"
+                val rawBytes = result.scanRecord?.bytes
+                val decoded = BleAdDecoder.parse(rawBytes)
+                val addressType = readBleAddressTypeSafely(result)
+                val fpHash = DeviceFingerprintEngine.fingerprintBle(mac, addressType, decoded)
+
+                val advertisedName = decoded.localName
+                    ?: result.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
+                val deviceName = advertisedName
+                    ?: readBleDeviceNameSafely(result)
+                    ?: decoded.trackerTag?.displayLabel
+                    ?: decoded.companyName
+                    ?: "BLE Emitter"
+
                 trySend(
                     RfMeasurement(
                         macAddress = mac,
@@ -144,7 +158,10 @@ class StandaloneRadioDataSource(
                         rttDistanceMeters = null,
                         rttStdDevMeters = null,
                         timestampElapsedMs = SystemClock.elapsedRealtime(),
-                        scanResult = null
+                        scanResult = null,
+                        fingerprintHash = fpHash,
+                        bleAddressType = addressType,
+                        bleDecoded = decoded
                     )
                 )
             }
@@ -191,7 +208,10 @@ class StandaloneRadioDataSource(
                             rttDistanceMeters = null,
                             rttStdDevMeters = null,
                             timestampElapsedMs = nowElapsed,
-                            scanResult = sr
+                            scanResult = sr,
+                            fingerprintHash = DeviceFingerprintEngine.fingerprintWifi(bssid),
+                            bleAddressType = null,
+                            bleDecoded = null
                         )
                     )
                 }
@@ -218,11 +238,9 @@ class StandaloneRadioDataSource(
             false
         }
 
-        // Emit any immediately available cached Wi-Fi scan results on startup
         emitLatestWifiResults()
         triggerWifiScan()
 
-        // Periodic Wi-Fi scan trigger (throttling-friendly cadence; Android dev option disables throttle)
         val wifiPollJob = scope.launch {
             while (isActive) {
                 delay(3_500L)
@@ -305,7 +323,8 @@ class StandaloneRadioDataSource(
                                         rttDistanceMeters = distanceMeters,
                                         rttStdDevMeters = stdDevMeters,
                                         timestampElapsedMs = SystemClock.elapsedRealtime(),
-                                        scanResult = scanResult
+                                        scanResult = scanResult,
+                                        fingerprintHash = DeviceFingerprintEngine.fingerprintWifi(mac)
                                     )
                                 )
                             }
@@ -317,6 +336,18 @@ class StandaloneRadioDataSource(
                     if (cont.isActive) cont.resume(null)
                 }
             }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readBleAddressTypeSafely(result: BleScanResult): Int? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) return null
+        return try {
+            result.device?.addressType
+        } catch (_: SecurityException) {
+            null
+        } catch (_: Exception) {
+            null
         }
     }
 

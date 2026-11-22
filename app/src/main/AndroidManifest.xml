@@ -24,6 +24,13 @@
     <!-- Native haptic Geiger proximity ticks -->
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- Optional on-demand permission for 2G voice/data downgrade Stingray detection (never requested at startup) -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+    <!-- Used strictly when user explicitly taps "Cache Map Area" to download offline CartoDB Dark Matter tiles -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- All radios and optional USB host marked non-required for standalone compatibility -->
     <uses-feature
         android:name="android.hardware.wifi"

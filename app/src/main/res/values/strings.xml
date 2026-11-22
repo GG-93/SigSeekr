@@ -12,6 +12,9 @@
     <string name="cd_close_dialog">Close dialog</string>
     <string name="cd_refresh_scan">Trigger manual Wi-Fi scan</string>
     <string name="cd_delete_snapshot">Delete saved snapshot</string>
+    <string name="cd_field_guide">Open offline SigSeeker tactical field guide</string>
+    <string name="cd_map_toggle">Toggle offline dark tactical map overlay</string>
+    <string name="cd_cache_map">Download offline map tiles for current area</string>
     <string name="permission_title">RF &amp; Inertial Permissions Required</string>
     <string name="permission_rationale">SigSeeker runs 100% offline using internal Wi-Fi RTT, BLE, and IMU sensors. Location and nearby radio permissions are required on Android 13/14+ and GrapheneOS so RSSI and RTT ranging data are not stripped.</string>
     <string name="permission_grant_button">Grant Sensor &amp; Radio Access</string>

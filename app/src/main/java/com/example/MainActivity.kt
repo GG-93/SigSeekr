@@ -1,5 +1,6 @@
 package com.example
 
+import android.Manifest
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -13,8 +14,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import com.example.data.ExportFormat
 import com.example.ui.PermissionHelper
+import com.example.ui.RadarScreen
 import com.example.ui.RadarViewModel
-import com.example.ui.SigSeekerScreen
 import com.example.ui.theme.SigSeekerTheme
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -32,6 +33,17 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshHardwareAndPermissionState()
+    }
+
+    /**
+     * Strictly on-demand READ_PHONE_STATE launcher triggered ONLY when the user
+     * taps "Grant Phone State for 2G Downgrade Alert" inside the Cell Towers tab.
+     * Degrades gracefully on GrapheneOS if denied.
+     */
+    private val phoneStatePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        viewModel.refreshCellularMonitor()
     }
 
     private val createJsonDocumentLauncher = registerForActivityResult(
@@ -59,9 +71,12 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             SigSeekerTheme {
-                SigSeekerScreen(
+                RadarScreen(
                     viewModel = viewModel,
                     onRequestPermissions = { requestAllRequiredPermissions() },
+                    onRequestPhoneStatePermission = {
+                        phoneStatePermissionLauncher.launch(Manifest.permission.READ_PHONE_STATE)
+                    },
                     onOpenAppSettings = { openAppSettings() },
                     onRequestExportFile = { format -> launchDocumentExporter(format) }
                 )

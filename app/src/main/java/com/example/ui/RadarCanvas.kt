@@ -1,53 +1,67 @@
 package com.example.ui
 
 import android.graphics.Bitmap
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.example.dsp.BackgroundEmitter
 import com.example.dsp.BayesianGridFilter
+import com.example.dsp.EmitterShapeStage
+import com.example.dsp.EmitterTransport
 import com.example.dsp.GridSnapshot
-import com.example.dsp.LocalizationTier
+import com.example.dsp.SweepCoachState
+import com.example.dsp.SweepStage
 import com.example.dsp.UserPose
+import com.example.maps.OfflineMapTileManager
+import com.example.maps.TileBounds
+import com.example.maps.TileCacheState
+import com.example.maps.TileCoord
 import com.example.ui.theme.CharcoalSurface
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.ObsidianBackground
@@ -61,80 +75,113 @@ import com.example.ui.theme.TacticalOutline
 import com.example.ui.theme.ThermalAmber
 import com.example.ui.theme.ThermalPlasmaLut
 import com.example.ui.theme.ThermalYellow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.Locale
+import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sin
-import kotlin.math.sqrt
+
+private data class LoadedMapTile(
+    val coord: TileCoord,
+    val bounds: TileBounds,
+    val imageBitmap: ImageBitmap
+)
 
 /**
- * 50m x 50m (100x100 cells @ 0.5m) Dark Tactical RF Radar Canvas.
- *
- * Uses a pre-allocated 100x100 ARGB Bitmap + IntArray mapped through
- * [ThermalPlasmaLut] so 10-15 FPS redraws perform zero heap allocations per frame.
+ * High-performance 100x100 Bayesian Thermal Plasma Radar Canvas layered over:
+ * 1. Optional Offline CartoDB Dark Matter Slippy Map PNG tiles (tactical dark filter)
+ * 2. 5m tactical range rings & grid lines
+ * 3. Pre-allocated 100x100 ARGB_8888 Thermal Plasma posterior heatmap
+ * 4. Guided Two-Spin Triangulation Triangle overlay (Anchor A/B, dotted bearings,
+ *    perpendicular walk corridor arrow, solid emerald/gold lock triangle)
+ * 5. 6-Stage Background Emitter shapes (Semicircle -> Hexagon -> Pinned) with tap hit-testing
+ * 6. User dead-reckoning trail, heading cone, shield null arc, and target peak reticle
  */
 @Composable
 fun RadarCanvas(
-    snapshot: GridSnapshot,
+    gridSnapshot: GridSnapshot,
     userPose: UserPose,
+    hasLockedTarget: Boolean,
     lockedTargetMac: String?,
-    isTargetStale: Boolean,
-    shieldDropDb: Float,
+    lockedTargetLabel: String?,
+    backgroundEmitters: List<BackgroundEmitter>,
+    sweepCoachState: SweepCoachState,
+    tileCacheState: TileCacheState,
+    mapOverlayEnabled: Boolean,
+    offlineMapTileManager: OfflineMapTileManager,
+    onTapBackgroundEmitter: (BackgroundEmitter) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    // Reusable pixel buffer & 100x100 heatmap bitmap (allocated once)
+    // Reusable ARGB_8888 bitmap & pixel array (zero per-frame heap churn)
+    val gridSize = BayesianGridFilter.GRID_SIZE
     val pixelBuffer = remember { IntArray(BayesianGridFilter.TOTAL_CELLS) }
-    val heatmapBitmap = remember {
-        Bitmap.createBitmap(
-            BayesianGridFilter.GRID_SIZE,
-            BayesianGridFilter.GRID_SIZE,
-            Bitmap.Config.ARGB_8888
-        )
+    val backingBitmap = remember {
+        Bitmap.createBitmap(gridSize, gridSize, Bitmap.Config.ARGB_8888)
     }
 
-    // Populate bitmap whenever an immutable GridSnapshot arrives
-    val imageBitmap = remember(snapshot.sequenceId, snapshot.updateCount) {
-        val probs = snapshot.probabilities
-        val maxP = snapshot.maxProbability
-        val uniformP = BayesianGridFilter.UNIFORM_PROB.toFloat()
-        val showHeat = snapshot.updateCount > 0L && maxP > uniformP * 1.15f
-        val lut = ThermalPlasmaLut.argbLut
-        val gridSize = BayesianGridFilter.GRID_SIZE
+    val imageBitmap = remember(gridSnapshot.sequenceId, hasLockedTarget) {
+        val probs = gridSnapshot.probabilities
+        val maxProb = gridSnapshot.maxProbability.coerceAtLeast(1e-9f)
+        val uniformThreshold = 1.0f / BayesianGridFilter.TOTAL_CELLS
+        val hasSignal = hasLockedTarget && gridSnapshot.updateCount > 0L && maxProb > uniformThreshold * 1.15f
 
-        if (!showHeat) {
+        if (!hasSignal) {
             pixelBuffer.fill(0x00000000)
         } else {
-            val invMax = 1.0f / maxP.coerceAtLeast(1e-12f)
-            for (yIdx in 0 until gridSize) {
-                // Flip Y so Cartesian +Y (North = 50m) renders at top row 0
-                val bitmapRow = (gridSize - 1) - yIdx
-                val srcRowOffset = yIdx * gridSize
+            val lut = ThermalPlasmaLut.argbLut
+            for (y in 0 until gridSize) {
+                val bitmapRow = gridSize - 1 - y
+                val srcRowOffset = y * gridSize
                 val dstRowOffset = bitmapRow * gridSize
-                for (xIdx in 0 until gridSize) {
-                    val p = probs[srcRowOffset + xIdx]
-                    val normalized = (p * invMax).coerceIn(0f, 1f)
-                    // Slight gamma lift (sqrt) reveals secondary contours clearly on dark obsidian
-                    val perceptual = sqrt(normalized)
-                    val lutIdx = (perceptual * 255f).toInt().coerceIn(0, 255)
-                    pixelBuffer[dstRowOffset + xIdx] = lut[lutIdx]
+                for (x in 0 until gridSize) {
+                    val norm = (probs[srcRowOffset + x] / maxProb).coerceIn(0f, 1f)
+                    val lutIndex = (norm.toDouble().pow(0.75) * 255.0).toInt().coerceIn(0, 255)
+                    pixelBuffer[dstRowOffset + x] = lut[lutIndex]
                 }
             }
         }
-        heatmapBitmap.setPixels(pixelBuffer, 0, gridSize, 0, 0, gridSize, gridSize)
-        heatmapBitmap.asImageBitmap()
+        backingBitmap.setPixels(pixelBuffer, 0, gridSize, 0, 0, gridSize, gridSize)
+        backingBitmap.asImageBitmap()
     }
 
-    val pulseTransition = rememberInfiniteTransition(label = "target_pulse")
-    val targetPulse by pulseTransition.animateFloat(
-        initialValue = 0.65f,
-        targetValue = 1.25f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 950, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_scale"
-    )
+    // Load cached offline OSM tiles off the main thread whenever anchor/cache count changes
+    var loadedTiles by remember { mutableStateOf<List<LoadedMapTile>>(emptyList()) }
+    val anchorGps = tileCacheState.anchorGps
 
-    val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS.toFloat()
+    LaunchedEffect(mapOverlayEnabled, anchorGps, tileCacheState.cachedTileCount) {
+        if (!mapOverlayEnabled || anchorGps == null || tileCacheState.cachedTileCount <= 0) {
+            loadedTiles = emptyList()
+            return@LaunchedEffect
+        }
+        loadedTiles = withContext(Dispatchers.IO) {
+            loadVisibleOfflineTiles(
+                manager = offlineMapTileManager,
+                anchorLat = anchorGps.latitude,
+                anchorLon = anchorGps.longitude
+            )
+        }
+    }
+
+    // Dark tactical color matrix filter for map tiles so neon RF overlays stay ultra-legible
+    val mapColorFilter = remember {
+        ColorFilter.colorMatrix(
+            ColorMatrix(
+                floatArrayOf(
+                    0.55f, 0f, 0f, 0f, -10f,
+                    0f, 0.65f, 0f, 0f, -6f,
+                    0f, 0f, 0.80f, 0f, 4f,
+                    0f, 0f, 0f, 0.72f, 0f
+                )
+            )
+        )
+    }
+
+    var legendExpanded by remember { mutableStateOf(false) }
+    val tapRadiusPx = with(LocalDensity.current) { 28.dp.toPx() }
 
     Box(
         modifier = modifier
@@ -143,221 +190,241 @@ fun RadarCanvas(
             .clip(RoundedCornerShape(14.dp))
             .background(ObsidianBackground)
             .border(1.dp, TacticalOutline, RoundedCornerShape(14.dp))
-            .testTag("radar_canvas")
+            .testTag("radar_canvas_container")
+            .semantics {
+                contentDescription = if (hasLockedTarget) {
+                    "RF probability radar tracking ${lockedTargetLabel ?: "target"} at " +
+                        String.format(Locale.US, "%.1f meters", gridSnapshot.estimatedDistanceMeters)
+                } else {
+                    "RF radar showing ${backgroundEmitters.size} background emitters. Tap a shape to inspect."
+                }
+            }
     ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(backgroundEmitters) {
+                    detectTapGestures { tapOffset ->
+                        val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS.toFloat()
+                        val width = size.width.toFloat()
+                        val height = size.height.toFloat()
+                        if (width <= 0f || height <= 0f || backgroundEmitters.isEmpty()) return@detectTapGestures
+
+                        var nearest: BackgroundEmitter? = null
+                        var bestDist = tapRadiusPx
+                        for (emitter in backgroundEmitters) {
+                            val ex = (emitter.estimatedX / arenaSize).coerceIn(0f, 1f) * width
+                            val ey = (1f - (emitter.estimatedY / arenaSize).coerceIn(0f, 1f)) * height
+                            val d = hypot(tapOffset.x - ex, tapOffset.y - ey)
+                            if (d <= bestDist) {
+                                bestDist = d
+                                nearest = emitter
+                            }
+                        }
+                        if (nearest != null) {
+                            onTapBackgroundEmitter(nearest)
+                        }
+                    }
+                }
+        ) {
             val w = size.width
             val h = size.height
-            val pxPerMeterX = w / arenaSize
-            val pxPerMeterY = h / arenaSize
+            val arenaSize = BayesianGridFilter.ARENA_SIZE_METERS.toFloat()
 
-            fun worldToCanvas(wx: Float, wy: Float): Offset {
-                return Offset(
-                    x = (wx / arenaSize) * w,
-                    y = (1f - (wy / arenaSize)) * h
-                )
+            fun worldToPx(wx: Double, wy: Double): Offset {
+                val px = ((wx / arenaSize).coerceIn(-0.5, 1.5) * w).toFloat()
+                val py = ((1.0 - (wy / arenaSize).coerceIn(-0.5, 1.5)) * h).toFloat()
+                return Offset(px, py)
             }
 
-            // 1. Subtle radial tactical vignette
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(Color(0xFF101826), ObsidianBackground),
-                    center = Offset(w * 0.5f, h * 0.5f),
-                    radius = w * 0.72f
-                )
-            )
+            // 1. Offline CartoDB Dark Matter Slippy Map Tiles (when enabled & cached)
+            if (mapOverlayEnabled && anchorGps != null && loadedTiles.isNotEmpty()) {
+                for (tile in loadedTiles) {
+                    val (westX, northY) = OfflineMapTileManager.latLonToGridMeters(
+                        latDeg = tile.bounds.northLat,
+                        lonDeg = tile.bounds.westLon,
+                        anchorLat = anchorGps.latitude,
+                        anchorLon = anchorGps.longitude
+                    )
+                    val (eastX, southY) = OfflineMapTileManager.latLonToGridMeters(
+                        latDeg = tile.bounds.southLat,
+                        lonDeg = tile.bounds.eastLon,
+                        anchorLat = anchorGps.latitude,
+                        anchorLon = anchorGps.longitude
+                    )
+                    val leftPx = ((westX / arenaSize) * w).roundToInt()
+                    val rightPx = ((eastX / arenaSize) * w).roundToInt()
+                    val topPx = ((1.0 - northY / arenaSize) * h).roundToInt()
+                    val bottomPx = ((1.0 - southY / arenaSize) * h).roundToInt()
+                    val dstW = (rightPx - leftPx).coerceAtLeast(1)
+                    val dstH = (bottomPx - topPx).coerceAtLeast(1)
 
-            // 2. Metric 5m Cartesian gridlines (10 divisions across 50m)
-            for (step in 1 until 10) {
-                val frac = step / 10f
-                val isCenterAxis = step == 5
-                val lineColor = if (isCenterAxis) TacticalOutline else TacticalGridLine
-                val strokeWidth = if (isCenterAxis) 1.4.dp.toPx() else 0.75.dp.toPx()
-
-                drawLine(
-                    color = lineColor,
-                    start = Offset(w * frac, 0f),
-                    end = Offset(w * frac, h),
-                    strokeWidth = strokeWidth
-                )
-                drawLine(
-                    color = lineColor,
-                    start = Offset(0f, h * frac),
-                    end = Offset(w, h * frac),
-                    strokeWidth = strokeWidth
-                )
-            }
-
-            // 3. Thermal Plasma 100x100 probability heatmap layer
-            if (snapshot.updateCount > 0L) {
-                drawImage(
-                    image = imageBitmap,
-                    dstOffset = IntOffset.Zero,
-                    dstSize = IntSize(w.toInt().coerceAtLeast(1), h.toInt().coerceAtLeast(1)),
-                    filterQuality = FilterQuality.Low
-                )
-            }
-
-            val userPx = worldToCanvas(userPose.xMeters.toFloat(), userPose.yMeters.toFloat())
-
-            // 4. Concentric range rings around operator (5m, 10m, 15m)
-            val dashEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
-            for (radiusM in listOf(5f, 10f, 15f)) {
-                drawCircle(
-                    color = ElectricCyan.copy(alpha = 0.16f),
-                    radius = radiusM * pxPerMeterX,
-                    center = userPx,
-                    style = Stroke(width = 1.dp.toPx(), pathEffect = dashEffect)
-                )
-            }
-
-            // 5. Walking dead-reckoning breadcrumb trail
-            val trail = userPose.trail
-            if (trail.size > 1) {
-                for (i in 1 until trail.size) {
-                    val p0 = worldToCanvas(trail[i - 1].x.toFloat(), trail[i - 1].y.toFloat())
-                    val p1 = worldToCanvas(trail[i].x.toFloat(), trail[i].y.toFloat())
-                    val ageAlpha = (0.15f + 0.75f * (i.toFloat() / trail.size.toFloat()))
-                    drawLine(
-                        color = ElectricCyan.copy(alpha = ageAlpha),
-                        start = p0,
-                        end = p1,
-                        strokeWidth = 2.dp.toPx(),
-                        cap = StrokeCap.Round
+                    drawImage(
+                        image = tile.imageBitmap,
+                        dstOffset = IntOffset(leftPx, topPx),
+                        dstSize = IntSize(dstW, dstH),
+                        colorFilter = mapColorFilter,
+                        filterQuality = FilterQuality.Low
                     )
                 }
             }
 
-            // 6. Cardioid Forward Sensitivity Cone & Rear Shield Null Arc
-            // Screen angle for mathematical heading theta: screenDeg = -toDegrees(theta)
-            val headingRad = userPose.headingRad.toFloat()
-            val screenHeadingDeg = -Math.toDegrees(userPose.headingRad).toFloat()
-            val coneRadius = 5.5f * pxPerMeterX
+            // 2. 5m Tactical Grid Lines
+            val gridSteps = 10
+            for (i in 1 until gridSteps) {
+                val frac = i.toFloat() / gridSteps
+                val stroke = if (i == 5) 1.5f else 0.8f
+                val color = if (i == 5) TacticalOutline else TacticalGridLine.copy(alpha = 0.72f)
+                drawLine(color = color, start = Offset(w * frac, 0f), end = Offset(w * frac, h), strokeWidth = stroke)
+                drawLine(color = color, start = Offset(0f, h * frac), end = Offset(w, h * frac), strokeWidth = stroke)
+            }
 
-            // Forward open lobe (cyan translucent wedge)
-            drawArc(
-                color = ElectricCyan.copy(alpha = 0.14f),
-                startAngle = screenHeadingDeg - 42f,
-                sweepAngle = 84f,
-                useCenter = true,
-                topLeft = Offset(userPx.x - coneRadius, userPx.y - coneRadius),
-                size = Size(coneRadius * 2f, coneRadius * 2f)
+            // 3. Concentric Range Rings (5m, 10m, 15m, 20m around center)
+            val centerPx = Offset(w * 0.5f, h * 0.5f)
+            val metersToPx = w / arenaSize
+            val ringStroke = Stroke(
+                width = 1.1f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
             )
-
-            // Rear body/aluminum shield attenuation arc (amber/crimson indicator)
-            val shieldRadius = 2.6f * pxPerMeterX
-            val shieldAlpha = ((shieldDropDb - 5f) / 25f).coerceIn(0.25f, 0.9f)
-            drawArc(
-                color = ThermalAmber.copy(alpha = shieldAlpha),
-                startAngle = screenHeadingDeg + 125f,
-                sweepAngle = 110f,
-                useCenter = false,
-                topLeft = Offset(userPx.x - shieldRadius, userPx.y - shieldRadius),
-                size = Size(shieldRadius * 2f, shieldRadius * 2f),
-                style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round)
-            )
-
-            // 7. Vector line & Pulsing Crosshair to Estimated Target Peak
-            if (lockedTargetMac != null && snapshot.updateCount > 0L) {
-                val targetPx = worldToCanvas(snapshot.estimatedTargetX, snapshot.estimatedTargetY)
-                val targetColor = if (isTargetStale) {
-                    ThermalAmber
-                } else if (snapshot.activeTier == LocalizationTier.RTT_TIER1) {
-                    SignalEmerald
-                } else {
-                    ThermalYellow
-                }
-
-                // Dashed range vector from operator to estimated target
-                drawLine(
-                    color = targetColor.copy(alpha = 0.55f),
-                    start = userPx,
-                    end = targetPx,
-                    strokeWidth = 1.4.dp.toPx(),
-                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
-                )
-
-                // Outer pulsing acquisition ring
-                val ringRadius = (10.dp.toPx()) * (if (isTargetStale) 1.0f else targetPulse)
+            for (radiusMeters in listOf(5f, 10f, 15f, 20f)) {
                 drawCircle(
-                    color = targetColor.copy(alpha = 0.35f),
-                    radius = ringRadius,
-                    center = targetPx,
-                    style = Stroke(width = 1.6.dp.toPx())
-                )
-
-                // Crisp tactical crosshair reticle
-                val crossLen = 9.dp.toPx()
-                val gap = 3.dp.toPx()
-                val crossStroke = 2.dp.toPx()
-                drawLine(
-                    targetColor,
-                    Offset(targetPx.x - crossLen, targetPx.y),
-                    Offset(targetPx.x - gap, targetPx.y),
-                    strokeWidth = crossStroke
-                )
-                drawLine(
-                    targetColor,
-                    Offset(targetPx.x + gap, targetPx.y),
-                    Offset(targetPx.x + crossLen, targetPx.y),
-                    strokeWidth = crossStroke
-                )
-                drawLine(
-                    targetColor,
-                    Offset(targetPx.x, targetPx.y - crossLen),
-                    Offset(targetPx.x, targetPx.y - gap),
-                    strokeWidth = crossStroke
-                )
-                drawLine(
-                    targetColor,
-                    Offset(targetPx.x, targetPx.y + gap),
-                    Offset(targetPx.x, targetPx.y + crossLen),
-                    strokeWidth = crossStroke
-                )
-                drawCircle(
-                    color = targetColor,
-                    radius = 2.5.dp.toPx(),
-                    center = targetPx
+                    color = TacticalOutline.copy(alpha = 0.65f),
+                    radius = radiusMeters * metersToPx,
+                    center = centerPx,
+                    style = ringStroke
                 )
             }
 
-            // 8. Operator Pose Chevron pointing along Cartesian heading theta
-            // World vector (cos(theta), sin(theta)) -> Screen vector (+cos(theta), -sin(theta))
-            val dirX = cos(headingRad)
-            val dirY = -sin(headingRad)
-            val perpX = -dirY
-            val perpY = dirX
-
-            val tipLen = 10.dp.toPx()
-            val tailLen = 6.dp.toPx()
-            val wingHalf = 6.5.dp.toPx()
-
-            val chevron = Path().apply {
-                moveTo(userPx.x + dirX * tipLen, userPx.y + dirY * tipLen)
-                lineTo(
-                    userPx.x - dirX * tailLen + perpX * wingHalf,
-                    userPx.y - dirY * tailLen + perpY * wingHalf
+            // 4. Thermal Plasma Bayesian Probability Heatmap
+            if (hasLockedTarget && gridSnapshot.updateCount > 0L) {
+                drawImage(
+                    image = imageBitmap,
+                    dstOffset = IntOffset.Zero,
+                    dstSize = IntSize(w.toInt(), h.toInt()),
+                    filterQuality = FilterQuality.Medium
                 )
-                lineTo(userPx.x - dirX * (tailLen * 0.35f), userPx.y - dirY * (tailLen * 0.35f))
-                lineTo(
-                    userPx.x - dirX * tailLen - perpX * wingHalf,
-                    userPx.y - dirY * tailLen - perpY * wingHalf
+            }
+
+            // 5. Guided Two-Spin Triangulation Triangle Overlay
+            if (hasLockedTarget && sweepCoachState.stage != SweepStage.IDLE) {
+                drawTriangulationOverlay(
+                    coach = sweepCoachState,
+                    userPose = userPose,
+                    gridSnapshot = gridSnapshot,
+                    metersToPx = metersToPx,
+                    worldToPx = ::worldToPx
                 )
+            }
+
+            // 6. 6-Stage Background Emitter Shapes (Semicircle -> Hexagon -> Pinned)
+            for (emitter in backgroundEmitters) {
+                val isCurrentlyLocked = lockedTargetMac != null &&
+                    (emitter.latestMacAddress == lockedTargetMac)
+                val pos = worldToPx(emitter.estimatedX.toDouble(), emitter.estimatedY.toDouble())
+                drawBackgroundEmitterShape(
+                    emitter = emitter,
+                    center = pos,
+                    isLocked = isCurrentlyLocked
+                )
+            }
+
+            // 7. User Dead-Reckoning Trail
+            val trail = userPose.trail
+            if (trail.size >= 2) {
+                val trailPath = Path()
+                val first = worldToPx(trail.first().x, trail.first().y)
+                trailPath.moveTo(first.x, first.y)
+                for (i in 1 until trail.size) {
+                    val pt = worldToPx(trail[i].x, trail[i].y)
+                    trailPath.lineTo(pt.x, pt.y)
+                }
+                drawPath(
+                    path = trailPath,
+                    color = ElectricCyan.copy(alpha = 0.72f),
+                    style = Stroke(width = 3.2f, cap = StrokeCap.Round)
+                )
+            }
+
+            // 8. User Position Marker, Forward Heading Cone & Rear Shield Null Arc
+            val userPx = worldToPx(userPose.xMeters, userPose.yMeters)
+            val theta = userPose.headingRad
+            val coneLength = 38f
+            val halfConeRad = Math.toRadians(24.0)
+
+            val coneTipLeft = Offset(
+                x = userPx.x + (coneLength * cos(theta + halfConeRad)).toFloat(),
+                y = userPx.y - (coneLength * sin(theta + halfConeRad)).toFloat()
+            )
+            val coneTipRight = Offset(
+                x = userPx.x + (coneLength * cos(theta - halfConeRad)).toFloat(),
+                y = userPx.y - (coneLength * sin(theta - halfConeRad)).toFloat()
+            )
+            val conePath = Path().apply {
+                moveTo(userPx.x, userPx.y)
+                lineTo(coneTipLeft.x, coneTipLeft.y)
+                lineTo(coneTipRight.x, coneTipRight.y)
                 close()
             }
-            drawPath(path = chevron, color = ElectricCyan)
-            drawPath(
-                path = chevron,
-                color = ObsidianBackground,
-                style = Stroke(width = 1.2.dp.toPx())
+            drawPath(path = conePath, color = ElectricCyan.copy(alpha = 0.28f))
+
+            // Rear shield null arc (behind user at theta + pi)
+            val screenHeadingDeg = (-Math.toDegrees(theta)).toFloat()
+            val shieldArcRadius = 22f
+            drawArc(
+                color = ThermalAmber.copy(alpha = 0.85f),
+                startAngle = screenHeadingDeg + 180f - 45f,
+                sweepAngle = 90f,
+                useCenter = false,
+                topLeft = Offset(userPx.x - shieldArcRadius, userPx.y - shieldArcRadius),
+                size = Size(shieldArcRadius * 2f, shieldArcRadius * 2f),
+                style = Stroke(width = 3.5f, cap = StrokeCap.Round)
             )
+
+            // Forward heading vector needle
+            val needleEnd = Offset(
+                x = userPx.x + (26f * cos(theta)).toFloat(),
+                y = userPx.y - (26f * sin(theta)).toFloat()
+            )
+            drawLine(
+                color = ElectricCyan,
+                start = userPx,
+                end = needleEnd,
+                strokeWidth = 3f,
+                cap = StrokeCap.Round
+            )
+
+            // User dot
+            drawCircle(color = ElectricCyan.copy(alpha = 0.30f), radius = 14f, center = userPx)
+            drawCircle(color = ElectricCyan, radius = 6.5f, center = userPx)
+            drawCircle(color = ObsidianBackground, radius = 2.5f, center = userPx)
+
+            // 9. Estimated Target Peak Crosshair Reticle
+            if (hasLockedTarget && gridSnapshot.updateCount > 0L) {
+                val peakPx = worldToPx(
+                    gridSnapshot.estimatedTargetX.toDouble(),
+                    gridSnapshot.estimatedTargetY.toDouble()
+                )
+                val lockColor = if (sweepCoachState.stage == SweepStage.LOCKED) SignalEmerald else ThermalYellow
+                val outerR = 16f
+                drawCircle(
+                    color = lockColor.copy(alpha = 0.95f),
+                    radius = outerR,
+                    center = peakPx,
+                    style = Stroke(width = 2.4f)
+                )
+                drawLine(lockColor, Offset(peakPx.x - outerR - 6f, peakPx.y), Offset(peakPx.x - 5f, peakPx.y), 2.2f)
+                drawLine(lockColor, Offset(peakPx.x + 5f, peakPx.y), Offset(peakPx.x + outerR + 6f, peakPx.y), 2.2f)
+                drawLine(lockColor, Offset(peakPx.x, peakPx.y - outerR - 6f), Offset(peakPx.x, peakPx.y - 5f), 2.2f)
+                drawLine(lockColor, Offset(peakPx.x, peakPx.y + 5f), Offset(peakPx.x, peakPx.y + outerR + 6f), 2.2f)
+                drawCircle(color = lockColor, radius = 3f, center = peakPx)
+            }
         }
 
-        // Cardinal Compass Overlays
+        // Cardinal Compass Labels (N / S / E / W)
         Text(
-            text = if (userPose.isHeadingZeroed) "N (ZEROED)" else "N",
+            text = "N",
             style = MaterialTheme.typography.labelSmall,
-            color = if (userPose.isHeadingZeroed) ThermalAmber else ElectricCyan,
+            color = ElectricCyan,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 6.dp)
@@ -387,124 +454,464 @@ fun RadarCanvas(
                 .padding(end = 6.dp)
         )
 
-        // Top-Left Active Tier & Grid Resolution Pill
-        val tierColor = when {
-            lockedTargetMac == null -> ReadoutInkMuted
-            isTargetStale -> TacticalCrimson
-            snapshot.activeTier == LocalizationTier.RTT_TIER1 -> SignalEmerald
-            snapshot.activeTier == LocalizationTier.SHIELD_TIER2 -> ThermalAmber
-            else -> ElectricCyan
-        }
-        val tierText = when {
-            lockedTargetMac == null -> "50×50m · 0.5m/CELL"
-            isTargetStale -> "LOCKED · SIGNAL STALE"
-            snapshot.updateCount == 0L -> "LOCKED · AWAITING PKTS"
-            else -> snapshot.activeTier.displayLabel
-        }
-        Box(
+        // Top-left scale + active emitter count badge
+        Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(8.dp)
-                .background(CharcoalSurface.copy(alpha = 0.86f), RoundedCornerShape(6.dp))
-                .border(1.dp, tierColor.copy(alpha = 0.55f), RoundedCornerShape(6.dp))
-                .padding(horizontal = 8.dp, vertical = 4.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(CharcoalSurface.copy(alpha = 0.86f))
+                .border(1.dp, TacticalOutline, RoundedCornerShape(6.dp))
+                .padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Text(
-                text = tierText,
-                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                color = tierColor
+                text = "50×50m",
+                style = MaterialTheme.typography.labelSmall,
+                color = ReadoutInkSecondary
+            )
+            Text(
+                text = "${backgroundEmitters.size} RF",
+                style = MaterialTheme.typography.labelSmall,
+                color = ElectricCyan
             )
         }
 
-        // Top-Right Estimated Coordinates Badge (when active)
-        if (lockedTargetMac != null && snapshot.updateCount > 0L) {
+        // Top-right thermal plasma legend / map status badge
+        if (hasLockedTarget) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(CharcoalSurface.copy(alpha = 0.86f))
+                    .border(1.dp, TacticalOutline, RoundedCornerShape(6.dp))
+                    .padding(horizontal = 6.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(ThermalYellow)
+                )
+                Text(
+                    text = "CEP95 ${String.format(Locale.US, "%.1fm", gridSnapshot.cep95Meters)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (gridSnapshot.cep95Meters <= 1.5f) SignalEmerald else ThermalYellow
+                )
+            }
+        } else if (mapOverlayEnabled && loadedTiles.isNotEmpty()) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(8.dp)
-                    .background(CharcoalSurface.copy(alpha = 0.86f), RoundedCornerShape(6.dp))
-                    .border(1.dp, TacticalOutline, RoundedCornerShape(6.dp))
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(CharcoalSurface.copy(alpha = 0.86f))
+                    .border(1.dp, SignalEmerald.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                    .padding(horizontal = 6.dp, vertical = 3.dp)
             ) {
                 Text(
-                    text = String.format(
-                        Locale.US,
-                        "EST %.1f, %.1fm",
-                        snapshot.estimatedTargetX,
-                        snapshot.estimatedTargetY
-                    ),
+                    text = "OSM ${loadedTiles.size}T",
                     style = MaterialTheme.typography.labelSmall,
-                    color = ThermalYellow
+                    color = SignalEmerald
                 )
             }
         }
 
-        // Bottom-Right Thermal Plasma Intensity Scale Legend
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(8.dp)
-                .background(CharcoalSurface.copy(alpha = 0.84f), RoundedCornerShape(6.dp))
-                .border(1.dp, TacticalOutline, RoundedCornerShape(6.dp))
-                .padding(horizontal = 7.dp, vertical = 4.dp)
-        ) {
-            Text(
-                text = "P(x,y)",
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
-                color = ReadoutInkSecondary
-            )
-            Box(
-                modifier = Modifier
-                    .width(52.dp)
-                    .height(6.dp)
-                    .clip(RoundedCornerShape(3.dp))
-                    .background(
-                        Brush.horizontalGradient(
-                            colors = listOf(
-                                Color(0xFF0D0887),
-                                Color(0xFF9C179E),
-                                Color(0xFFED7953),
-                                ThermalYellow
-                            )
-                        )
-                    )
-            )
-        }
-
-        // Bottom-Left Shield Drop Indicator
-        Box(
+        // Bottom-left compact 6-Shape Corner Legend (expandable)
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(8.dp)
-                .background(CharcoalSurface.copy(alpha = 0.84f), RoundedCornerShape(6.dp))
-                .border(1.dp, TacticalOutline, RoundedCornerShape(6.dp))
+                .clip(RoundedCornerShape(8.dp))
+                .background(CharcoalSurface.copy(alpha = 0.90f))
+                .border(1.dp, TacticalOutline, RoundedCornerShape(8.dp))
+                .clickable { legendExpanded = !legendExpanded }
                 .padding(horizontal = 7.dp, vertical = 4.dp)
+                .testTag("radar_shape_legend_toggle")
         ) {
             Text(
-                text = String.format(Locale.US, "SHIELD -%.0fdB", shieldDropDb),
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
-                color = ThermalAmber
+                text = if (legendExpanded) "6-STAGE SHAPES ▾" else "SHAPES ▸",
+                style = MaterialTheme.typography.labelSmall,
+                color = ReadoutInkPrimary
             )
+            if (legendExpanded) {
+                Spacer(modifier = Modifier.size(3.dp))
+                LegendShapeRow(EmitterShapeStage.SEMICIRCLE, "180°", ElectricCyan)
+                LegendShapeRow(EmitterShapeStage.TRIANGLE, "120°", ElectricCyan)
+                LegendShapeRow(EmitterShapeStage.SQUARE, "90°", ThermalAmber)
+                LegendShapeRow(EmitterShapeStage.PENTAGON, "45°", ThermalAmber)
+                LegendShapeRow(EmitterShapeStage.HEXAGON, "20°", SignalEmerald)
+                LegendShapeRow(EmitterShapeStage.PINNED, "PIN", ThermalYellow)
+            }
         }
 
-        // Empty guidance chip when no target is locked
-        if (lockedTargetMac == null) {
+        // Bottom-right hint when no target is locked
+        if (!hasLockedTarget) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 36.dp)
-                    .background(CharcoalSurface.copy(alpha = 0.90f), RoundedCornerShape(8.dp))
-                    .border(1.dp, ElectricCyan.copy(alpha = 0.45f), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(CharcoalSurface.copy(alpha = 0.86f))
+                    .border(1.dp, TacticalOutline, RoundedCornerShape(6.dp))
+                    .padding(horizontal = 6.dp, vertical = 3.dp)
             ) {
                 Text(
-                    text = "Tap TARGET above to lock a single Wi-Fi or BLE emitter",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = ReadoutInkPrimary
+                    text = "TAP SHAPE → DOSSIER",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ReadoutInkSecondary
                 )
             }
         }
     }
+}
+
+@Composable
+private fun LegendShapeRow(
+    stage: EmitterShapeStage,
+    band: String,
+    tint: Color
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        modifier = Modifier.padding(vertical = 1.dp)
+    ) {
+        Canvas(modifier = Modifier.size(10.dp)) {
+            drawGeometricStageMarker(
+                stage = stage,
+                center = Offset(size.width / 2f, size.height / 2f),
+                radius = size.minDimension * 0.44f,
+                color = tint,
+                isLocked = false
+            )
+        }
+        Text(
+            text = "${stage.label} ($band)",
+            style = MaterialTheme.typography.labelSmall,
+            color = ReadoutInkSecondary
+        )
+    }
+}
+
+private fun DrawScope.drawTriangulationOverlay(
+    coach: SweepCoachState,
+    userPose: UserPose,
+    gridSnapshot: GridSnapshot,
+    metersToPx: Float,
+    worldToPx: (Double, Double) -> Offset
+) {
+    val userPx = worldToPx(userPose.xMeters, userPose.yMeters)
+    val targetPx = worldToPx(
+        gridSnapshot.estimatedTargetX.toDouble(),
+        gridSnapshot.estimatedTargetY.toDouble()
+    )
+    val anchorAPx = coach.anchorA?.let { worldToPx(it.x, it.y) }
+    val anchorBPx = coach.anchorB?.let { worldToPx(it.x, it.y) }
+
+    val dottedEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+    val isLocked = coach.stage == SweepStage.LOCKED
+
+    // 1. Circular Spin Progress Ring around user during SPIN_1 or SPIN_2
+    if (coach.stage == SweepStage.SPIN_1 || coach.stage == SweepStage.SPIN_2) {
+        val ringR = 34f
+        drawCircle(
+            color = TacticalOutline.copy(alpha = 0.85f),
+            radius = ringR,
+            center = userPx,
+            style = Stroke(width = 3.5f)
+        )
+        val sweepDeg = (coach.progressFraction.coerceIn(0f, 1f) * 360f)
+        drawArc(
+            color = ElectricCyan,
+            startAngle = -90f,
+            sweepAngle = sweepDeg,
+            useCenter = false,
+            topLeft = Offset(userPx.x - ringR, userPx.y - ringR),
+            size = Size(ringR * 2f, ringR * 2f),
+            style = Stroke(width = 4.2f, cap = StrokeCap.Round)
+        )
+    }
+
+    // 2. Perpendicular Walk Corridor Arrow during WALK_PERPENDICULAR
+    if (coach.stage == SweepStage.WALK_PERPENDICULAR && anchorAPx != null) {
+        val corridorLenPx = coach.targetWalkMeters * metersToPx
+        val bearings = listOfNotNull(coach.perpendicularWalkBearingARad, coach.perpendicularWalkBearingBRad)
+        for (bRad in bearings) {
+            val endPt = Offset(
+                x = anchorAPx.x + (corridorLenPx * cos(bRad)).toFloat(),
+                y = anchorAPx.y - (corridorLenPx * sin(bRad)).toFloat()
+            )
+            // Glowing corridor halo + arrow shaft
+            drawLine(
+                color = ThermalAmber.copy(alpha = 0.22f),
+                start = anchorAPx,
+                end = endPt,
+                strokeWidth = 14f,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = ThermalAmber,
+                start = anchorAPx,
+                end = endPt,
+                strokeWidth = 3f,
+                cap = StrokeCap.Round
+            )
+            // Arrowhead chevrons
+            val headLen = 14f
+            val leftWing = Offset(
+                x = endPt.x - (headLen * cos(bRad - 0.5)).toFloat(),
+                y = endPt.y + (headLen * sin(bRad - 0.5)).toFloat()
+            )
+            val rightWing = Offset(
+                x = endPt.x - (headLen * cos(bRad + 0.5)).toFloat(),
+                y = endPt.y + (headLen * sin(bRad + 0.5)).toFloat()
+            )
+            drawLine(ThermalAmber, endPt, leftWing, 3f, StrokeCap.Round)
+            drawLine(ThermalAmber, endPt, rightWing, 3f, StrokeCap.Round)
+        }
+    }
+
+    // 3. Anchor A -> Target bearing line (dotted while sweeping, solid glowing emerald/gold when LOCKED)
+    if (anchorAPx != null) {
+        val edgeColor = if (isLocked) SignalEmerald else ElectricCyan.copy(alpha = 0.85f)
+        if (isLocked) {
+            drawLine(
+                color = SignalEmerald.copy(alpha = 0.26f),
+                start = anchorAPx,
+                end = targetPx,
+                strokeWidth = 9f,
+                cap = StrokeCap.Round
+            )
+        }
+        drawLine(
+            color = edgeColor,
+            start = anchorAPx,
+            end = targetPx,
+            strokeWidth = if (isLocked) 3.2f else 2.2f,
+            pathEffect = if (isLocked) null else dottedEffect
+        )
+    }
+
+    // 4. Solid Baseline Path from Anchor A -> Anchor B (or current user position during walk)
+    if (anchorAPx != null) {
+        val baselineEnd = anchorBPx ?: if (coach.stage == SweepStage.WALK_PERPENDICULAR) userPx else null
+        if (baselineEnd != null) {
+            val baseColor = if (isLocked) ThermalYellow else ElectricCyan
+            if (isLocked) {
+                drawLine(
+                    color = ThermalYellow.copy(alpha = 0.24f),
+                    start = anchorAPx,
+                    end = baselineEnd,
+                    strokeWidth = 9f,
+                    cap = StrokeCap.Round
+                )
+            }
+            drawLine(
+                color = baseColor,
+                start = anchorAPx,
+                end = baselineEnd,
+                strokeWidth = if (isLocked) 3.4f else 2.8f,
+                cap = StrokeCap.Round
+            )
+        }
+    }
+
+    // 5. Anchor B -> Target second bearing line
+    if (anchorBPx != null) {
+        val edgeColor = if (isLocked) SignalEmerald else ThermalAmber.copy(alpha = 0.90f)
+        if (isLocked) {
+            drawLine(
+                color = SignalEmerald.copy(alpha = 0.26f),
+                start = anchorBPx,
+                end = targetPx,
+                strokeWidth = 9f,
+                cap = StrokeCap.Round
+            )
+        }
+        drawLine(
+            color = edgeColor,
+            start = anchorBPx,
+            end = targetPx,
+            strokeWidth = if (isLocked) 3.2f else 2.2f,
+            pathEffect = if (isLocked) null else dottedEffect
+        )
+    }
+
+    // 6. Anchor A and Anchor B Diamond Pins
+    if (anchorAPx != null) {
+        drawAnchorPin(center = anchorAPx, fill = ElectricCyan)
+    }
+    if (anchorBPx != null) {
+        drawAnchorPin(center = anchorBPx, fill = if (isLocked) ThermalYellow else ThermalAmber)
+    }
+}
+
+private fun DrawScope.drawAnchorPin(center: Offset, fill: Color) {
+    val r = 7.5f
+    val diamond = Path().apply {
+        moveTo(center.x, center.y - r)
+        lineTo(center.x + r, center.y)
+        lineTo(center.x, center.y + r)
+        lineTo(center.x - r, center.y)
+        close()
+    }
+    drawPath(diamond, color = fill.copy(alpha = 0.35f))
+    drawPath(diamond, color = fill, style = Stroke(width = 2.2f))
+    drawCircle(color = ObsidianBackground, radius = 2.2f, center = center)
+}
+
+private fun DrawScope.drawBackgroundEmitterShape(
+    emitter: BackgroundEmitter,
+    center: Offset,
+    isLocked: Boolean
+) {
+    val baseColor = when {
+        emitter.shapeStage == EmitterShapeStage.PINNED -> SignalEmerald
+        emitter.trackerTag?.isPotentialUnwantedTracker == true -> TacticalCrimson
+        emitter.isRttResponder -> SignalEmerald
+        emitter.transport == EmitterTransport.BLE -> ElectricCyan
+        else -> ThermalAmber
+    }
+    val radius = when (emitter.shapeStage) {
+        EmitterShapeStage.PINNED -> 12f
+        EmitterShapeStage.HEXAGON -> 10.5f
+        else -> 9.5f
+    }
+
+    drawGeometricStageMarker(
+        stage = emitter.shapeStage,
+        center = center,
+        radius = radius,
+        color = baseColor,
+        isLocked = isLocked
+    )
+}
+
+/**
+ * Draws the exact 6-stage geometric shape for an emitter on either the radar canvas
+ * or the Field Guide / legend mini-preview.
+ */
+fun DrawScope.drawGeometricStageMarker(
+    stage: EmitterShapeStage,
+    center: Offset,
+    radius: Float,
+    color: Color,
+    isLocked: Boolean = false
+) {
+    if (isLocked) {
+        drawCircle(
+            color = ThermalYellow.copy(alpha = 0.28f),
+            radius = radius + 6f,
+            center = center
+        )
+    }
+
+    when (stage) {
+        EmitterShapeStage.SEMICIRCLE -> {
+            drawArc(
+                color = color.copy(alpha = 0.30f),
+                startAngle = 180f,
+                sweepAngle = 180f,
+                useCenter = true,
+                topLeft = Offset(center.x - radius, center.y - radius),
+                size = Size(radius * 2f, radius * 2f)
+            )
+            drawArc(
+                color = color,
+                startAngle = 180f,
+                sweepAngle = 180f,
+                useCenter = true,
+                topLeft = Offset(center.x - radius, center.y - radius),
+                size = Size(radius * 2f, radius * 2f),
+                style = Stroke(width = 2.0f)
+            )
+        }
+
+        EmitterShapeStage.TRIANGLE -> {
+            drawRegularPolygon(center, radius, sides = 3, color = color)
+        }
+
+        EmitterShapeStage.SQUARE -> {
+            drawRegularPolygon(center, radius, sides = 4, color = color, rotationOffsetRad = PI / 4.0)
+        }
+
+        EmitterShapeStage.PENTAGON -> {
+            drawRegularPolygon(center, radius, sides = 5, color = color)
+        }
+
+        EmitterShapeStage.HEXAGON -> {
+            drawRegularPolygon(center, radius, sides = 6, color = color)
+        }
+
+        EmitterShapeStage.PINNED -> {
+            // Permanent glowing emerald & gold concentric target circle
+            drawCircle(color = SignalEmerald.copy(alpha = 0.25f), radius = radius + 4f, center = center)
+            drawCircle(color = SignalEmerald, radius = radius, center = center, style = Stroke(width = 2.4f))
+            drawCircle(color = ThermalYellow, radius = radius * 0.52f, center = center, style = Stroke(width = 1.8f))
+            drawCircle(color = ThermalYellow, radius = 2.5f, center = center)
+        }
+    }
+}
+
+private fun DrawScope.drawRegularPolygon(
+    center: Offset,
+    radius: Float,
+    sides: Int,
+    color: Color,
+    rotationOffsetRad: Double = -PI / 2.0
+) {
+    val path = Path()
+    for (i in 0 until sides) {
+        val angle = rotationOffsetRad + (2.0 * PI * i / sides)
+        val x = center.x + (radius * cos(angle)).toFloat()
+        val y = center.y + (radius * sin(angle)).toFloat()
+        if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+    }
+    path.close()
+    drawPath(path = path, color = color.copy(alpha = 0.28f))
+    drawPath(path = path, color = color, style = Stroke(width = 2.1f))
+}
+
+/**
+ * Loads cached offline Slippy Map PNG tiles covering the 50m x 50m radar arena.
+ * Prefers zoom 18 for crisp street/building footprint detail, falling back to z17 / z16.
+ */
+private fun loadVisibleOfflineTiles(
+    manager: OfflineMapTileManager,
+    anchorLat: Double,
+    anchorLon: Double
+): List<LoadedMapTile> {
+    val arena = BayesianGridFilter.ARENA_SIZE_METERS
+    val (southLat, westLon) = OfflineMapTileManager.gridMetersToLatLon(0.0, 0.0, anchorLat, anchorLon)
+    val (northLat, eastLon) = OfflineMapTileManager.gridMetersToLatLon(arena, arena, anchorLat, anchorLon)
+
+    for (zoom in listOf(18, 17, 16)) {
+        val topLeft = OfflineMapTileManager.latLonToTile(northLat, westLon, zoom)
+        val bottomRight = OfflineMapTileManager.latLonToTile(southLat, eastLon, zoom)
+        val xMin = minOf(topLeft.x, bottomRight.x)
+        val xMax = maxOf(topLeft.x, bottomRight.x)
+        val yMin = minOf(topLeft.y, bottomRight.y)
+        val yMax = maxOf(topLeft.y, bottomRight.y)
+
+        val loaded = mutableListOf<LoadedMapTile>()
+        for (x in xMin..xMax) {
+            for (y in yMin..yMax) {
+                val bmp = manager.loadCachedTileBitmap(zoom, x, y) ?: continue
+                loaded.add(
+                    LoadedMapTile(
+                        coord = TileCoord(zoom, x, y),
+                        bounds = OfflineMapTileManager.tileToLatLonBounds(zoom, x, y),
+                        imageBitmap = bmp.asImageBitmap()
+                    )
+                )
+            }
+        }
+        if (loaded.isNotEmpty()) return loaded
+    }
+    return emptyList()
 }

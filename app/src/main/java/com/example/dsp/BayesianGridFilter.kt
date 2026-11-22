@@ -17,7 +17,7 @@ import kotlin.math.sqrt
  * Index layout: index = yIdx * GRID_SIZE + xIdx where xIdx in 0..99, yIdx in 0..99.
  *
  * Designed to run exclusively on Dispatchers.Default and publish immutable
- * FloatArray snapshots to Compose Canvas at 10-15 FPS.
+ * FloatArray snapshots (including exact CEP95 radius) to Compose Canvas at 10-15 FPS.
  */
 class BayesianGridFilter {
     companion object {
@@ -29,6 +29,8 @@ class BayesianGridFilter {
         const val UNDERFLOW_EPSILON = 1e-12
         const val MIN_DISTANCE_METERS = 0.25
         private val MAX_ENTROPY = ln(TOTAL_CELLS.toDouble())
+        private const val CEP_HISTOGRAM_BINS = 140 // 0.5m radial bins covering up to 70m diagonal
+        private const val CEP_BIN_WIDTH_M = 0.5
     }
 
     private val lock = Any()
@@ -41,6 +43,9 @@ class BayesianGridFilter {
     // Double-buffered normalized probability matrices
     private var frontBuffer = DoubleArray(TOTAL_CELLS) { UNIFORM_PROB }
     private var backBuffer = DoubleArray(TOTAL_CELLS) { UNIFORM_PROB }
+
+    // Reusable radial probability histogram for O(N) zero-allocation CEP95 calculation
+    private val radialMassHistogram = DoubleArray(CEP_HISTOGRAM_BINS)
 
     private var updateCount: Long = 0L
     private var activeTier: LocalizationTier = LocalizationTier.NONE
@@ -149,7 +154,6 @@ class BayesianGridFilter {
 
     private fun normalizeAndSwapLocked(totalWeight: Double, tier: LocalizationTier) {
         if (!totalWeight.isFinite() || totalWeight <= UNDERFLOW_EPSILON) {
-            // Underflow protection: reset to uniform distribution
             backBuffer.fill(UNIFORM_PROB)
         } else {
             val invTotal = 1.0 / totalWeight
@@ -158,7 +162,6 @@ class BayesianGridFilter {
             }
         }
 
-        // Swap double buffers so frontBuffer always holds the latest normalized state
         val temp = frontBuffer
         frontBuffer = backBuffer
         backBuffer = temp
@@ -169,8 +172,8 @@ class BayesianGridFilter {
     }
 
     /**
-     * Produces an immutable FloatArray snapshot plus MAP peak coordinates and
-     * Shannon-entropy convergence score for thread-safe Compose Canvas rendering.
+     * Produces an immutable FloatArray snapshot plus MAP peak coordinates,
+     * exact CEP95 radial convergence metric, and Shannon-entropy score.
      */
     fun createSnapshot(userX: Double, userY: Double): GridSnapshot {
         synchronized(lock) {
@@ -197,8 +200,6 @@ class BayesianGridFilter {
                 }
             }
 
-            // Compute weighted local centroid in a 5x5 neighborhood around the MAP peak
-            // for sub-cell (~0.1m) smooth estimation without multi-modal smearing.
             var localWeightSum = 0.0
             var weightedX = 0.0
             var weightedY = 0.0
@@ -230,6 +231,12 @@ class BayesianGridFilter {
             }
 
             val estDist = if (updateCount == 0L) 0.0 else hypot(estX - userX, estY - userY)
+            val cep95 = if (updateCount == 0L) {
+                25.0
+            } else {
+                computeCep95Locked(estX, estY)
+            }
+
             val normalizedConfidence = if (updateCount == 0L) {
                 0
             } else {
@@ -243,11 +250,44 @@ class BayesianGridFilter {
                 estimatedTargetX = estX.toFloat(),
                 estimatedTargetY = estY.toFloat(),
                 estimatedDistanceMeters = estDist.toFloat(),
+                cep95Meters = cep95.toFloat(),
                 peakConfidencePct = normalizedConfidence,
                 updateCount = updateCount,
                 activeTier = activeTier
             )
         }
+    }
+
+    /**
+     * Computes O(N) radial 95th-percentile Circular Error Probable (CEP95) around
+     * (estX, estY) using 0.5m histogram bins with linear sub-bin interpolation.
+     */
+    private fun computeCep95Locked(estX: Double, estY: Double): Double {
+        radialMassHistogram.fill(0.0)
+        for (yIdx in 0 until GRID_SIZE) {
+            val dy = cellCenterY[yIdx] - estY
+            val dySq = dy * dy
+            val rowOffset = yIdx * GRID_SIZE
+            for (xIdx in 0 until GRID_SIZE) {
+                val p = frontBuffer[rowOffset + xIdx]
+                if (p <= 1e-12) continue
+                val dx = cellCenterX[xIdx] - estX
+                val dist = sqrt(dx * dx + dySq)
+                val bin = (dist / CEP_BIN_WIDTH_M).toInt().coerceIn(0, CEP_HISTOGRAM_BINS - 1)
+                radialMassHistogram[bin] += p
+            }
+        }
+
+        var cumulative = 0.0
+        for (bin in 0 until CEP_HISTOGRAM_BINS) {
+            val binMass = radialMassHistogram[bin]
+            if (cumulative + binMass >= 0.95) {
+                val frac = if (binMass > 1e-12) ((0.95 - cumulative) / binMass).coerceIn(0.0, 1.0) else 1.0
+                return (bin + frac) * CEP_BIN_WIDTH_M
+            }
+            cumulative += binMass
+        }
+        return CEP_HISTOGRAM_BINS * CEP_BIN_WIDTH_M
     }
 
     /** Direct read-only sum check helper for diagnostics and unit tests. */

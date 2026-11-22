@@ -7,15 +7,17 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import com.example.dsp.AngleMath
 import com.example.dsp.BayesianGridFilter
+import com.example.dsp.MagneticFieldStatus
 import com.example.dsp.Point2D
 import com.example.dsp.UserPose
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.PI
+import kotlin.math.sqrt
 
 /**
- * Inertial Dead-Reckoning Engine locked to the 50m x 50m Cartesian arena.
+ * Inertial Dead-Reckoning Engine + Ambient Magnetic Flux Anomaly Monitor.
  *
  * - Initializes user at (25.0m, 25.0m).
  * - Reads azimuth psi in [-pi, pi] from SensorManager.getOrientation()
@@ -24,13 +26,27 @@ import kotlin.math.PI
  * - On TYPE_STEP_DETECTOR:
  *       x_{t+1} = x_t + L_step * cos(theta)
  *       y_{t+1} = y_t + L_step * sin(theta)
+ * - Monitors TYPE_MAGNETIC_FIELD total flux B = sqrt(Bx^2 + By^2 + Bz^2) (uT)
+ *   and flags `isMagneticWarped = true` whenever B < 25 uT or B > 70 uT.
  */
 class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
 
     companion object {
         const val START_X_METERS = 25.0
         const val START_Y_METERS = 25.0
+        const val MIN_NOMINAL_FLUX_UT = 25.0f
+        const val MAX_NOMINAL_FLUX_UT = 70.0f
         private const val MAX_TRAIL_POINTS = 500
+
+        fun computeMagneticStatus(bx: Float, by: Float, bz: Float): MagneticFieldStatus {
+            val flux = sqrt(bx * bx + by * by + bz * bz)
+            val warped = !flux.isFinite() || flux < MIN_NOMINAL_FLUX_UT || flux > MAX_NOMINAL_FLUX_UT
+            return MagneticFieldStatus(
+                fluxMicroTesla = if (flux.isFinite()) flux else 0f,
+                isMagneticWarped = warped,
+                hasSensorReading = true
+            )
+        }
     }
 
     private val sensorManager =
@@ -54,6 +70,9 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
     val hasStepDetector: Boolean
         get() = stepDetectorSensor != null
 
+    val hasMagnetometer: Boolean
+        get() = magnetSensor != null
+
     private val lock = Any()
     private val rotationMatrix = FloatArray(9)
     private val orientationAngles = FloatArray(3)
@@ -61,6 +80,7 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
     private val lastMagnet = FloatArray(3)
     private var hasAccel = false
     private var hasMagnet = false
+    private var smoothedFluxUt: Float? = null
 
     @Volatile
     private var stepLengthMeters: Double = 0.72
@@ -80,6 +100,9 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
     )
     val pose: StateFlow<UserPose> = _pose.asStateFlow()
 
+    private val _magneticStatus = MutableStateFlow(MagneticFieldStatus())
+    val magneticStatus: StateFlow<MagneticFieldStatus> = _magneticStatus.asStateFlow()
+
     fun start() {
         synchronized(lock) {
             if (isStarted) return
@@ -91,7 +114,15 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
                 )
             } else if (accelSensor != null && magnetSensor != null) {
                 sensorManager.registerListener(this, accelSensor, SensorManager.SENSOR_DELAY_GAME)
-                sensorManager.registerListener(this, magnetSensor, SensorManager.SENSOR_DELAY_GAME)
+            }
+
+            // Always monitor raw magnetometer flux B (uT) for ferromagnetic rebar/metal distortion
+            if (magnetSensor != null) {
+                sensorManager.registerListener(
+                    this,
+                    magnetSensor,
+                    SensorManager.SENSOR_DELAY_UI
+                )
             }
 
             if (stepDetectorSensor != null) {
@@ -195,7 +226,7 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
             Sensor.TYPE_ACCELEROMETER -> {
                 System.arraycopy(event.values, 0, lastAccel, 0, 3)
                 hasAccel = true
-                if (hasMagnet &&
+                if (rotationVectorSensor == null && hasMagnet &&
                     SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMagnet)
                 ) {
                     SensorManager.getOrientation(rotationMatrix, orientationAngles)
@@ -206,7 +237,25 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
             Sensor.TYPE_MAGNETIC_FIELD -> {
                 System.arraycopy(event.values, 0, lastMagnet, 0, 3)
                 hasMagnet = true
-                if (hasAccel &&
+
+                // Monitor total magnetic flux B = sqrt(Bx^2 + By^2 + Bz^2) in uT
+                val rawFlux = sqrt(
+                    event.values[0] * event.values[0] +
+                        event.values[1] * event.values[1] +
+                        event.values[2] * event.values[2]
+                )
+                if (rawFlux.isFinite()) {
+                    val prev = smoothedFluxUt
+                    val filtered = if (prev == null) rawFlux else (prev * 0.75f + rawFlux * 0.25f)
+                    smoothedFluxUt = filtered
+                    _magneticStatus.value = MagneticFieldStatus(
+                        fluxMicroTesla = filtered,
+                        isMagneticWarped = filtered < MIN_NOMINAL_FLUX_UT || filtered > MAX_NOMINAL_FLUX_UT,
+                        hasSensorReading = true
+                    )
+                }
+
+                if (rotationVectorSensor == null && hasAccel &&
                     SensorManager.getRotationMatrix(rotationMatrix, null, lastAccel, lastMagnet)
                 ) {
                     SensorManager.getOrientation(rotationMatrix, orientationAngles)
@@ -236,6 +285,6 @@ class ImuDeadReckoningEngine(context: Context) : SensorEventListener {
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-        // No-op; manual Zero Heading button allows immediate field calibration near metal/rebar
+        // Handled continuously via total magnetic flux monitor and manual Zero Heading
     }
 }
